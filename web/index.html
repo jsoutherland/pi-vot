@@ -1,0 +1,81 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <link id="status-favicon" rel="icon" type="image/svg+xml" />
+    <link rel="stylesheet" href="/style.css" />
+    <title>pi - Ready</title>
+  </head>
+  <body>
+    <main id="app-shell">
+      <header id="app-header">
+        <h1>Pi-vot</h1>
+        <div id="project-controls">
+          <span>Project</span>
+          <code id="project-directory">Loading…</code>
+          <label class="visually-hidden" for="project-path">Project directory path</label>
+          <input id="project-path" type="text" autocomplete="off" spellcheck="false" placeholder="Project directory path" />
+          <button id="pick-project" type="button">Choose…</button>
+          <button id="select-project" type="button">Open</button>
+        </div>
+      </header>
+      <div id="workspace">
+        <aside id="session-sidebar" aria-label="Pi sessions">
+          <div id="session-toolbar">
+            <button id="new-session" type="button">+ New Session</button>
+            <button id="refresh-sessions" type="button" aria-label="Refresh sessions" title="Refresh sessions">↻</button>
+          </div>
+          <ul id="session-list"></ul>
+        </aside>
+        <section id="conversation-pane">
+          <section id="conversation" aria-live="off" aria-label="Conversation"></section>
+          <p id="status" data-state="idle" role="status"></p>
+          <section id="context-panel" aria-label="Session context and model">
+            <div id="model-info">
+              <span class="visually-hidden">Model:</span>
+              <button id="model-trigger" type="button" aria-label="Current model: Loading…" aria-haspopup="listbox" aria-expanded="false" aria-controls="model-picker">
+                <span id="model-name">Loading…</span>
+                <span aria-hidden="true">▾</span>
+              </button>
+              <section id="model-picker" aria-label="Select model" hidden>
+                <p id="model-picker-status" role="status" aria-live="polite"></p>
+                <ul id="model-options" role="listbox" aria-label="Available models"></ul>
+                <p id="model-picker-message"></p>
+                <button id="model-picker-refresh" type="button">Refresh models</button>
+              </section>
+            </div>
+            <div class="context-heading">
+              <span>Context</span>
+              <span id="context-value">Loading…</span>
+              <span id="context-percent">Unavailable</span>
+              <button id="compact" type="button">Compact</button>
+            </div>
+            <meter id="context-meter" min="0" max="100" value="0" aria-label="Context usage"></meter>
+            <p id="context-status" aria-live="polite"></p>
+          </section>
+          <div id="composer-splitter" role="separator" aria-label="Resize message composer" aria-orientation="horizontal" aria-valuemin="96" aria-valuemax="55" aria-valuenow="24" tabindex="0"></div>
+          <form id="message-form">
+            <div id="attachment-area">
+              <p id="attachment-warning" role="status" hidden></p>
+              <div id="attachment-strip" aria-label="Pending image attachments"></div>
+              <button id="attach-images" type="button" aria-label="Attach images" title="Attach images">+</button>
+            </div>
+            <div id="drop-overlay" role="status" hidden>Drop images here</div>
+            <label class="visually-hidden" for="message">Message Pi</label>
+            <textarea id="message" name="message" placeholder="Message Pi..." rows="2"></textarea>
+            <div id="composer-actions">
+              <button id="wake" type="button" hidden>Wake</button>
+              <button id="send" type="submit">Send</button>
+              <button id="stop" type="button" hidden>Stop</button>
+            </div>
+            <input id="image-picker" type="file" accept="image/*" multiple hidden />
+          </form>
+        </section>
+      </div>
+    </main>
+    <script src="/vendor/highlight.min.js"></script>
+    <script src="/vendor/marked.umd.js"></script>
+    <script type="module" src="/main.js"></script>
+  </body>
+</html>

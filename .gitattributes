@@ -1,0 +1,3 @@
+# Integrity-checked vendored assets must remain byte-for-byte identical across platforms.
+web/vendor/marked.umd.js -text
+web/vendor/highlight.min.js -text

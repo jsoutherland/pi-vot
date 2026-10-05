@@ -1,0 +1,28 @@
+{
+  "components": [
+    {
+      "name": "Marked",
+      "version": "16.4.1",
+      "npmPackage": "marked",
+      "upstreamProject": "Marked",
+      "repository": "https://github.com/markedjs/marked",
+      "license": "MIT",
+      "licenseFile": "marked-LICENSE.md",
+      "sourceFile": "lib/marked.umd.js",
+      "vendoredFile": "marked.umd.js",
+      "sha256": "aced561246e2cf95f6a7007310a73c2edfc86e2ee136ae0c11a59f9ac8fee097"
+    },
+    {
+      "name": "Highlight.js",
+      "version": "11.12.0",
+      "npmPackage": "@highlightjs/cdn-assets",
+      "upstreamProject": "Highlight.js",
+      "repository": "https://github.com/highlightjs/highlight.js",
+      "license": "BSD-3-Clause",
+      "licenseFile": "highlight-LICENSE",
+      "sourceFile": "highlight.min.js",
+      "vendoredFile": "highlight.min.js",
+      "sha256": "8ab71eb09c51f501e5e25157d9cff100e46cc29bcbfc744d0b746d451fca7f53"
+    }
+  ]
+}
