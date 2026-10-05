@@ -274,6 +274,12 @@ npm audit --audit-level=low
 - General-file/PDF attachments are not implemented; image attachments are supported.
 - Features depend on the RPC capabilities exposed by the installed Pi version. Missing native capabilities are reported or shown as unavailable rather than replaced with a parallel Pi-vot implementation.
 
+## Contributing
+
+I’m not accepting general pull requests at this time, unless we already know each other and have discussed the change.
+
+Issues are very welcome, though. If you find a bug, have a feature request, or want to suggest an improvement, please open an issue.
+
 ## License
 
 Apache License 2.0. See [`LICENSE`](LICENSE).
