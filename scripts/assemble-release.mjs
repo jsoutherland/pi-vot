@@ -1,4 +1,4 @@
-import { cp, mkdir, readdir, rm, stat, writeFile } from "node:fs/promises";
+import { cp, mkdir, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -9,6 +9,8 @@ const compiledFiles = [
   "runtime-policy.js",
   "pi-service.js",
   "runtime-registry.js",
+  "big-pi.js",
+  "billion-context-pi.js",
   "request.js",
 ];
 const webFiles = [
@@ -16,6 +18,7 @@ const webFiles = [
   "main.js",
   "markdown-security.js",
   "style.css",
+  "help.md",
   "vendor/THIRD_PARTY.json",
   "vendor/highlight-LICENSE",
   "vendor/highlight.min.js",
@@ -40,9 +43,23 @@ for (const file of webFiles) {
 }
 await writeFile(resolve(outputRoot, "app/package.json"), `${JSON.stringify({ type: "module" }, null, 2)}\n`);
 await copyRequired(resolve(repositoryRoot, "README.md"), resolve(outputRoot, "README.md"));
+await copyRequired(resolve(repositoryRoot, "CHANGELOG.md"), resolve(outputRoot, "CHANGELOG.md"));
 await copyRequired(resolve(repositoryRoot, "LICENSE"), resolve(outputRoot, "LICENSE"));
+await copyRequired(resolve(repositoryRoot, "pi-vot-extension.js"), resolve(outputRoot, "pi-vot-extension.js"));
+await copyRequired(resolve(repositoryRoot, "browser-launch.js"), resolve(outputRoot, "browser-launch.js"));
+const rootPackage = JSON.parse(await readFile(resolve(repositoryRoot, "package.json"), "utf8"));
+await writeFile(resolve(outputRoot, "package.json"), `${JSON.stringify({
+  name: rootPackage.name,
+  version: rootPackage.version,
+  description: "Pi-vot browser UI launcher for Pi",
+  license: rootPackage.license,
+  private: true,
+  type: "module",
+  keywords: ["pi-package"],
+  pi: { extensions: ["./pi-vot-extension.js"] },
+}, null, 2)}\n`);
 
-const releaseFiles = [...compiledFiles.map((file) => `app/${file}`), ...webFiles.map((file) => `app/web/${file}`), "app/package.json", "README.md", "LICENSE"];
+const releaseFiles = [...compiledFiles.map((file) => `app/${file}`), ...webFiles.map((file) => `app/web/${file}`), "app/package.json", "README.md", "CHANGELOG.md", "LICENSE", "pi-vot-extension.js", "browser-launch.js", "package.json"];
 const unexpected = [];
 async function inspect(directory, prefix = "") {
   for (const entry of await readdir(directory, { withFileTypes: true })) {

@@ -1,10 +1,11 @@
 import assert from "node:assert/strict";
-import { mkdtemp, mkdir, readFile, rm } from "node:fs/promises";
+import { mkdtemp, mkdir, readFile, realpath, rm } from "node:fs/promises";
 import { createServer } from "node:net";
 import { spawn } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
+import { pathToFileURL } from "node:url";
 
 const releaseRoot = resolve(process.argv[2] ?? "");
 if (!process.argv[2]) throw new Error("Usage: node scripts/smoke-release.mjs <release-directory>");
@@ -23,7 +24,7 @@ await new Promise((resolveClose) => portProbe.close(resolveClose));
 
 const child = spawn(process.execPath, [join(releaseRoot, "app/server.js")], {
   cwd: callerDirectory,
-  env: { ...process.env, PATH: isolatedPath, PORT: "1", PI_VOT_PORT: String(port) },
+  env: { ...process.env, PATH: isolatedPath, PORT: "1", PI_VOT_PORT: String(port), PI_VOT_OPEN_BROWSER: "0" },
   stdio: ["ignore", "pipe", "pipe"],
 });
 let output = "";
@@ -45,11 +46,33 @@ async function waitForServer() {
 
 try {
   const startHere = await readFile(join(releaseRoot, "START-HERE.txt"), "utf8");
+  const packageManifest = JSON.parse(await readFile(join(releaseRoot, "package.json"), "utf8"));
+  assert.deepEqual(packageManifest.pi?.extensions, ["./pi-vot-extension.js"]);
+  const extensionModule = await import(pathToFileURL(join(releaseRoot, "pi-vot-extension.js")).href);
+  let registeredCommand;
+  extensionModule.default({
+    registerCommand(name, options) {
+      registeredCommand = { name, options };
+    },
+  });
+  assert.equal(registeredCommand?.name, "pi-vot");
+  assert.match(registeredCommand.options.description, /browser app/);
+  assert.match(startHere, /Minimum Node\.js: >= 22\.19\.0/);
+  assert.match(startHere, /Recommended\/tested baseline: Node 22/);
+  assert.match(startHere, /Newer Node versions are allowed/);
+  assert.match(startHere, /Older Node override/);
   assert.match(startHere, /PI_VOT_PORT/);
   assert.match(startHere, /generic PORT is ignored/);
   assert.match(startHere, /\$env:PI_VOT_ALLOW_UNSUPPORTED_NODE = "1"/);
   assert.match(startHere, /set PI_VOT_ALLOW_UNSUPPORTED_NODE=1/);
+  assert.match(startHere, /Optional Pi executable override/);
+  assert.match(startHere, /PI_VOT_PI_EXECUTABLE pins the installed Pi executable or launcher explicitly/);
+  assert.match(startHere, /must be an absolute path; project-relative paths are not accepted/);
+  assert.match(startHere, /\$env:PI_VOT_PI_EXECUTABLE = "C:\\Users\\you\\AppData\\Roaming\\npm\\pi\.cmd"/);
+  assert.match(startHere, /set "PI_VOT_PI_EXECUTABLE=C:\\Users\\you\\AppData\\Roaming\\npm\\pi\.cmd"/);
   assert.match(startHere, /node "C:\\Tools\\pi-vot-[^"]+-win-x64\\app\\server\.js"/);
+  assert.match(startHere, /Restart Pi if it was already running/);
+  assert.match(startHere, /pi install pi-vot.*names an npm package/i);
 
   const page = await waitForServer();
   assert.equal(page.status, 200);
@@ -60,7 +83,7 @@ try {
   const health = await fetch(`http://127.0.0.1:${port}/api/health`);
   assert.equal(health.status, 200);
   const snapshot = await health.json();
-  assert.equal(resolve(snapshot.projectDirectory), callerDirectory);
+  assert.equal(await realpath(snapshot.projectDirectory), await realpath(callerDirectory));
   assert.match(output, new RegExp(`127\\.0\\.0\\.1:${port}`));
 } finally {
   if (child.exitCode === null) {

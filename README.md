@@ -8,8 +8,8 @@ Inactive persisted sessions can be inspected without starting a runtime. Choose 
 
 ## Requirements
 
-- Node.js 22.19 or newer in the Node 22 release line
-- `pi` installed and available on `PATH`
+- Node.js `>=22.19.0` (Node 22 is the recommended/tested baseline; newer versions are allowed but may have less validation)
+- `pi` installed and available in an absolute `PATH` directory, or configured with `PI_VOT_PI_EXECUTABLE`
 - Pi configured with at least one provider/model
 - Windows 11, macOS, or Linux
 - Chromium/Chrome for the supported browser experience and browser tests
@@ -21,7 +21,7 @@ npm ci
 npm run dev
 ```
 
-Open the local URL printed by the server. The default is:
+The app opens in your system's default browser after the server is ready. The default local URL is:
 
 ```text
 http://127.0.0.1:17361
@@ -49,11 +49,43 @@ npm start
 
 The default port is `17361`. `PI_VOT_PORT` is the only port override; generic `PORT` and the former `PI_PANE_PORT` are ignored. Pi-vot binds to `127.0.0.1` only.
 
+### Install as a Pi package
+
+Pi-vot's source directory and extracted release directory are Pi packages. Install either one by passing its directory to Pi:
+
+```sh
+pi install /path/to/pi-vot
+```
+
+On Windows, quote the directory path if it contains spaces:
+
+```powershell
+pi install "C:\Tools\pi-vot-0.2.0-win-x64"
+```
+
+Install the extracted release folder by path. `pi install pi-vot` names an npm package; it does not point to the Windows release folder. After installing, restart Pi if it was already running, then type `/pi-vot` at Pi's prompt. Pi-vot starts in the current project directory and opens in the default browser. The command reuses an already-running Pi-vot server on the selected port. To remove the package later, run `pi remove <same-path>`.
+
+Pi's package interface registers slash commands and CLI flags; it does not provide package-defined top-level commands such as `pi pi-vot`. Use `/pi-vot` inside Pi, or launch the app directly with `npm start` or the release launcher.
+
+Set `PI_VOT_OPEN_BROWSER=0` to start the server without opening a browser automatically.
+
+Pi-vot resolves Pi from `PATH` independently of the selected project directory. For locked-down installations, set `PI_VOT_PI_EXECUTABLE` to the absolute path of the installed Pi executable or launcher. On Windows this can be the absolute path to Pi's `.cmd` shim:
+
+```powershell
+$env:PI_VOT_PI_EXECUTABLE = "C:\Users\you\AppData\Roaming\npm\pi.cmd"
+npm start
+Remove-Item Env:PI_VOT_PI_EXECUTABLE
+```
+
+For opt-in troubleshooting, set `PI_VOT_DEBUG=1` or `PI_VOT_DEBUG=true` (case-insensitive). Pi-vot writes a concise JSONL event log beside each session transcript as `<session>.jsonl.pi-vot-debug.jsonl`; it keeps the full event history instead of truncating at a byte limit, and session deletion removes it. Message text, tool inputs, and tool outputs are not logged.
+
+Relative paths are rejected. Pi-vot does not search the selected project for Pi.
+
 ## Portable Windows release
 
 ### Build machine
 
-With Node.js 22.19 or newer in the Node 22 release line:
+With Node.js `>=22.19.0` (Node 22 is the recommended/tested baseline; newer versions are allowed but may have less validation):
 
 ```sh
 npm ci
@@ -66,7 +98,7 @@ Before extracting a ZIP transferred across an air gap, verify its SHA-256 with t
 
 ### Target machine
 
-Requirements: approved Node.js 22.19 or newer in the Node 22 release line, Pi installed and configured separately, and Chrome/Chromium.
+Requirements: Node.js `>=22.19.0` (Node 22 is the recommended/tested baseline; newer versions are allowed but may have less validation), Pi installed and configured separately, and Chrome/Chromium.
 
 Preferred:
 
@@ -99,9 +131,9 @@ set PI_VOT_PORT=18000
 node "C:\Tools\pi-vot-<version>-win-x64\app\server.js"
 ```
 
-#### Temporary unsupported Node override (testing only)
+#### Node versions below the minimum
 
-The supported production runtime is Node.js `>=22.19.0 <23.0.0`. For temporary testing or troubleshooting with a Node version outside that range, set `PI_VOT_ALLOW_UNSUPPORTED_NODE` to exactly `1` before launching `server.js`. This is unsupported; reproduce problems on supported Node 22 before treating them as Pi-vot defects. No `PI_PANE_*` variables are supported.
+The minimum Node.js version is `>=22.19.0`; Node 22 is the recommended/tested baseline. Newer Node versions are allowed, with an advisory warning when running a major newer than Node 22; they may not have received the same level of validation. `PI_VOT_ALLOW_UNSUPPORTED_NODE` is only needed to bypass the minimum-version check for older Node versions and must be exactly `1`. No `PI_PANE_*` variables are supported.
 
 ```powershell
 $env:PI_VOT_ALLOW_UNSUPPORTED_NODE = "1"
@@ -128,6 +160,8 @@ Do not weaken local PowerShell policy solely for Pi-vot. If organizational polic
 - A green dot beside a session means Pi-vot currently owns a live runtime for it. Selection and runtime ownership are separate states.
 - Project groups can be collapsed without stopping their sessions.
 - **+ New Session** creates a Pi session in the current project directory.
+- Big Pi is optional; Pi-vot works normally without it. When a session has a `session.jsonl.big-pi/` folder, Pi-vot displays regular-file disk usage without following symlinks and counts chunks from the committed index in `manifest.json` (`schemaVersion: 1`, `producer: "big-pi"`). The manifest's `session.sessionPath` must match the transcript; entries require `B`-plus-digits IDs, tiers 1–3, unique safe `blocks/<filename>.json` paths, and lowercase 64-character SHA-256 values. Counts include indexed chunks even when dormant, superseded, missing, or damaged; temporary and unreferenced files contribute only to disk usage. Invalid or unsupported manifests show counts as unavailable. Pi-vot does not read chunk summaries or use the legacy `.big-pi.json` sidecar for counts.
+- Billion Context Pi is also detected from the selected session's `<session>.jsonl.acp.json` sidecar when its `producer` starts with `billion-context-pi@`. Pi-vot reads only the sidecar metadata needed to count persisted `blocks[]` entries by tier; it does not read summaries or activate Pi for inactive sessions. The Context block icon marks this source with a `B` in its top box and its hover shows T1/T2/T3/total. When both plugins' session data are detected, Billion Context Pi is the displayed source and the yellow warning popover adds a coexistence notice beneath any Pi notices.
 - **Stop** aborts the current Pi operation but keeps the runtime available.
 - **Close runtime** releases an idle runtime while preserving its native Pi session/history.
 - Rename and delete operate on Pi's persisted session data. A live runtime must be closed before its session can be deleted.
@@ -226,7 +260,8 @@ Original third-party license texts are included under `web/vendor/`.
 Pi-vot:
 
 - binds only to `127.0.0.1`
-- validates local Host/Origin values for mutation requests
+- requires every `/api/*` request to come from a loopback peer and use `127.0.0.1:<port>` or `localhost:<port>` for its Host authority
+- additionally validates the Origin on mutation requests when present
 - uses a restrictive Content Security Policy
 - sends `X-Content-Type-Options: nosniff`
 - sends `Referrer-Policy: no-referrer`
@@ -239,7 +274,7 @@ Pi-vot:
 - validates image attachment MIME/signature/size server-side
 - does not store provider credentials
 
-These controls are defense in depth; they do not replace normal dependency review, code review, or vulnerability scanning.
+Pi-vot is a single-user localhost application without per-user or application authentication. These controls are defense in depth; they do not replace normal dependency review, code review, or vulnerability scanning.
 
 ## Development and validation
 

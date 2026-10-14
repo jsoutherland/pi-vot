@@ -1,40 +1,64 @@
 export const MINIMUM_NODE_VERSION = "22.19.0";
-export const MAXIMUM_NODE_VERSION_EXCLUSIVE = "23.0.0";
-export const SUPPORTED_NODE_VERSION_RANGE = `>=${MINIMUM_NODE_VERSION} <${MAXIMUM_NODE_VERSION_EXCLUSIVE}`;
-const [minimumMajor, minimumMinor, minimumPatch] = MINIMUM_NODE_VERSION.split(".").map(Number);
-const maximumMajor = Number(MAXIMUM_NODE_VERSION_EXCLUSIVE.split(".", 1)[0]);
+export const TESTED_NODE_MAJOR = 22;
+export const SUPPORTED_NODE_VERSION_RANGE = `>=${MINIMUM_NODE_VERSION}`;
 
 export type NodeVersionDecision =
   | { status: "supported" }
   | { status: "blocked"; error: string }
-  | { status: "allowed"; warning: string };
+  | { status: "allowed"; warning: string }
+  | { status: "newer"; warning: string };
+
+function parseNodeVersion(version: string): [number, number, number] | null {
+  const match = /^v?(\d+)\.(\d+)\.(\d+)$/.exec(version);
+  if (!match) return null;
+  const parsed = [Number(match[1]), Number(match[2]), Number(match[3])];
+  if (!parsed.every(Number.isSafeInteger)) return null;
+  return parsed as [number, number, number];
+}
+
+function isBelowMinimum(version: [number, number, number]): boolean {
+  const minimum = MINIMUM_NODE_VERSION.split(".").map(Number) as [number, number, number];
+  for (let index = 0; index < minimum.length; index += 1) {
+    if (version[index]! !== minimum[index]!) return version[index]! < minimum[index]!;
+  }
+  return false;
+}
 
 export function nodeVersionError(version: string): string | null {
-  const match = /^v?(\d+)\.(\d+)\.(\d+)$/.exec(version);
-  if (!match) return `Could not determine the Node.js version. Detected: ${version || "unknown"}`;
-  const [, majorText, minorText] = match;
-  const major = Number(majorText);
-  const minor = Number(minorText);
-  const patch = Number(match[3]);
-  if (major !== minimumMajor || major >= maximumMajor) {
-    return `Pi-vot currently supports Node ${minimumMajor}.x only.\nDetected: ${version}`;
-  }
-  if (major < minimumMajor || minor < minimumMinor || (minor === minimumMinor && patch < minimumPatch)) {
-    return `Pi-vot requires Node ${minimumMajor}.${minimumMinor} or newer within the Node ${minimumMajor} release line.\nDetected: ${version}`;
+  const parsedVersion = parseNodeVersion(version);
+  if (!parsedVersion) return `Could not determine the Node.js version. Detected: ${version || "unknown"}`;
+  if (isBelowMinimum(parsedVersion)) {
+    return `Pi-vot requires Node.js ${SUPPORTED_NODE_VERSION_RANGE}.\nDetected: ${version}`;
   }
   return null;
 }
 
 export function nodeVersionDecision(version: string, allowUnsupportedValue?: string): NodeVersionDecision {
-  const error = nodeVersionError(version);
-  if (!error) return { status: "supported" };
-  if (allowUnsupportedValue === "1") {
+  const parsedVersion = parseNodeVersion(version);
+  if (!parsedVersion) {
     return {
-      status: "allowed",
-      warning: `WARNING: Running Pi-vot with unsupported Node version ${version || "unknown"}.\n` +
-        `Supported range: ${SUPPORTED_NODE_VERSION_RANGE}\n` +
-        "PI_VOT_ALLOW_UNSUPPORTED_NODE=1 is set; continuing anyway.",
+      status: "blocked",
+      error: `Could not determine the Node.js version. Detected: ${version || "unknown"}`,
     };
   }
-  return { status: "blocked", error };
+  if (isBelowMinimum(parsedVersion)) {
+    const error = nodeVersionError(version)!;
+    if (allowUnsupportedValue === "1") {
+      return {
+        status: "allowed",
+        warning: `WARNING: Pi-vot is running on Node ${version} below the minimum ${MINIMUM_NODE_VERSION}.\n` +
+          "PI_VOT_ALLOW_UNSUPPORTED_NODE=1 is set; continuing anyway.",
+      };
+    }
+    return { status: "blocked", error };
+  }
+  if (parsedVersion[0] > TESTED_NODE_MAJOR) {
+    return {
+      status: "newer",
+      warning: `WARNING: Pi-vot is running on Node ${version}.\n` +
+        `The recommended/tested runtime is Node ${MINIMUM_NODE_VERSION} or newer within Node ${TESTED_NODE_MAJOR}.\n` +
+        "Continuing because newer Node versions are permitted.",
+    };
+  }
+  return { status: "supported" };
 }

@@ -1,19 +1,241 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
+import { spawn } from "node:child_process";
 import { EventEmitter } from "node:events";
-import { appendFile, mkdtemp, mkdir, readFile, rm, stat, writeFile } from "node:fs/promises";
+import { appendFile, lstat, mkdtemp, mkdir, readFile, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import test from "node:test";
 import { PassThrough, Writable } from "node:stream";
 import type { ChildProcessWithoutNullStreams } from "node:child_process";
 import {
   PiService,
+  appendPiVotDebugEvent,
+  createPiSpawnSpec,
+  deletePiSessionFiles,
   discoverPiSessions,
   hydratePiSession,
+  piVotDebugLogEnabled,
+  piVotDebugLogPath,
   piSessionDirectoryName,
+  resolvePiExecutable,
   resolvePiSessionDirectory,
   type PiVotEvent,
 } from "../src/pi-service.ts";
+
+test("Pi executable resolution cannot be shadowed by files in the selected project", () => {
+  const project = "C:\\untrusted\\project";
+  const trusted = "C:\\trusted\\npm";
+  for (const projectExecutable of ["pi.cmd", "pi.exe"]) {
+    const selectedFile = `${project}\\${projectExecutable}`;
+    const trustedFile = `${trusted}\\${projectExecutable}`;
+    const candidates: string[] = [];
+    const executable = resolvePiExecutable(
+      { PATH: trusted },
+      "win32",
+      (candidate) => {
+        candidates.push(candidate);
+        return candidate.toLowerCase() === trustedFile.toLowerCase() ||
+          candidate.toLowerCase() === selectedFile.toLowerCase();
+      },
+    );
+    assert.equal(executable, trustedFile);
+    assert.ok(!candidates.includes(selectedFile));
+  }
+});
+
+test("Pi-vot debug logging accepts 1/true case-insensitively and retains concise event history", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "pi-vot-debug-log-"));
+  const sessionPath = join(directory, "session.jsonl");
+  const logPath = piVotDebugLogPath(sessionPath);
+  try {
+    assert.equal(piVotDebugLogEnabled({ PI_VOT_DEBUG: "1" }), true);
+    assert.equal(piVotDebugLogEnabled({ PI_VOT_DEBUG: "TRUE" }), true);
+    assert.equal(piVotDebugLogEnabled({ PI_VOT_DEBUG: " yes " }), false);
+    await appendPiVotDebugEvent(sessionPath, "disabled", {}, {});
+    await assert.rejects(stat(logPath), { code: "ENOENT" });
+    for (let index = 0; index < 2_000; index++) {
+      await appendPiVotDebugEvent(sessionPath, "event", { index }, { PI_VOT_DEBUG: "true" });
+    }
+    const contents = await readFile(logPath, "utf8");
+    assert.ok(Buffer.byteLength(contents) > 64 * 1024);
+    assert.match(contents, /"index":0\}/);
+    assert.match(contents, /"index":1999\}/);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("Pi executable resolution is independent of project cwd changes", () => {
+  const resolved = resolvePiExecutable(
+    { PATH: "C:\\trusted\\bin" },
+    "win32",
+    (candidate) => candidate.toLowerCase() === "c:\\trusted\\bin\\pi.exe",
+  );
+  const firstProject = createPiSpawnSpec(resolved, "C:\\project-one", "win32");
+  const secondProject = createPiSpawnSpec(resolved, "C:\\project-two", "win32");
+  assert.equal(firstProject.command, secondProject.command);
+  assert.deepEqual(firstProject.args, secondProject.args);
+  assert.equal(firstProject.options.cwd, "C:\\project-one");
+  assert.equal(secondProject.options.cwd, "C:\\project-two");
+});
+
+test("fresh Pi sessions start RPC directly on the requested persisted session ID", () => {
+  const id = "9e859972-24c4-48b6-8db9-f84d2ff7c752";
+  const spec = createPiSpawnSpec("/usr/bin/pi", "/project", "linux", undefined, id);
+  assert.deepEqual(spec.args, ["--mode", "rpc", "--session-id", id]);
+  assert.throws(
+    () => createPiSpawnSpec("/usr/bin/pi", "/project", "linux", undefined, "bad id; command"),
+    /unsupported characters/,
+  );
+});
+
+test("Windows PATH resolution selects a native Pi launcher and ignores the extensionless npm shim", () => {
+  const directory = "C:\\Users\\south\\AppData\\Roaming\\npm";
+  const checked: string[] = [];
+  const executable = resolvePiExecutable(
+    { PATH: directory },
+    "win32",
+    (candidate) => {
+      checked.push(candidate);
+      return candidate.toLowerCase() === `${directory}\\pi.cmd`.toLowerCase();
+    },
+  );
+  assert.equal(executable, `${directory}\\pi.cmd`);
+  assert.ok(!checked.includes(`${directory}\\pi`));
+});
+
+test("Windows Pi cmd launchers use their absolute path without shell-injectable arguments", () => {
+  const launcher = "C:\\Program Files\\Pi & Tools\\pi.cmd";
+  const spec = createPiSpawnSpec(launcher, "C:\\project & echo unsafe", "win32", "C:\\Windows");
+  assert.equal(spec.command, "C:\\Windows\\System32\\cmd.exe");
+  assert.deepEqual(spec.args, ["/d", "/v:off", "/s", "/c", `""${launcher}" --mode rpc"`]);
+  assert.equal(spec.options.cwd, "C:\\project & echo unsafe");
+  assert.equal(spec.options.shell, false);
+  assert.equal(spec.options.windowsVerbatimArguments, true);
+  assert.equal(
+    createPiSpawnSpec("C:\\Pi\\pi.exe", "C:\\project", "win32").options.windowsVerbatimArguments,
+    undefined,
+  );
+  assert.throws(
+    () => createPiSpawnSpec('C:\\Pi\\pi.cmd" & whoami.cmd', "C:\\project", "win32"),
+    /cannot be safely invoked/,
+  );
+  assert.throws(
+    () => createPiSpawnSpec("C:\\100%\\pi.cmd", "C:\\project", "win32"),
+    /cannot be safely invoked/,
+  );
+});
+
+test("Windows cmd and bat Pi launchers execute with exact RPC arguments and cwd", {
+  skip: process.platform !== "win32",
+  timeout: 15_000,
+}, async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-vot-windows-launch-"));
+  const project = join(root, "Project & echo INJECTED & Workspace");
+  const installations = [join(root, "Pi & echo INJECTED & Tools")];
+  await mkdir(project, { recursive: true });
+
+  try {
+    for (const extension of [".cmd", ".bat"]) {
+      const installation = join(installations[0]!, extension.slice(1));
+      await mkdir(installation, { recursive: true });
+      const launcher = join(installation, `pi${extension}`);
+      const record = join(installation, "launcher-record.txt");
+      const cwdRecord = join(installation, "cwd-record.txt");
+      await writeFile(launcher, [
+        "@echo off",
+        `> "%~dp0launcher-record.txt" echo executed`,
+        `>> "%~dp0launcher-record.txt" echo arg1=[%~1]`,
+        `>> "%~dp0launcher-record.txt" echo arg2=[%~2]`,
+        `>> "%~dp0launcher-record.txt" echo arg3=[%~3]`,
+        `cd > "%~dp0cwd-record.txt"`,
+        "echo startup-stdout",
+        ">&2 echo startup-stderr",
+        "exit /b 23",
+        "",
+      ].join("\r\n"));
+      await writeFile(join(project, `pi${extension}`), "@echo off\r\nexit /b 99\r\n");
+
+      const executable = resolvePiExecutable({ PATH: dirname(launcher) }, "win32");
+      assert.equal(executable, launcher);
+      const spec = createPiSpawnSpec(executable, project, "win32");
+      assert.equal(spec.options.shell, false);
+      assert.equal(spec.command.toLowerCase().endsWith("\\system32\\cmd.exe"), true);
+      assert.equal(spec.options.windowsVerbatimArguments, true);
+      assert.ok(!spec.args.some((argument) => argument.includes("\\\"")));
+
+      const child = spawn(spec.command, spec.args, spec.options);
+      let stdout = "";
+      child.stdout.setEncoding("utf8");
+      child.stdout.on("data", (chunk: string) => { stdout += chunk; });
+      let stderr = "";
+      child.stderr.setEncoding("utf8");
+      child.stderr.on("data", (chunk: string) => { stderr += chunk; });
+      const timeout = setTimeout(() => child.kill(), 10_000);
+      let result: { code: number | null; signal: NodeJS.Signals | null };
+      try {
+        result = await new Promise((resolve, reject) => {
+          child.once("error", reject);
+          child.once("close", (code, signal) => resolve({ code, signal }));
+        });
+      } finally {
+        clearTimeout(timeout);
+      }
+
+      assert.equal(result.signal, null, stderr);
+      assert.equal(result.code, 23, stderr);
+      assert.match(stdout, /startup-stdout/);
+      assert.match(stderr, /startup-stderr/);
+      assert.equal(stdout.includes("INJECTED"), false, stdout);
+      assert.deepEqual((await readFile(record, "utf8")).trim().split(/\r?\n/), [
+        "executed",
+        "arg1=[--mode]",
+        "arg2=[rpc]",
+        "arg3=[]",
+      ]);
+      assert.equal((await readFile(cwdRecord, "utf8")).trim(), project);
+    }
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("Pi executable configuration requires an absolute existing supported file", () => {
+  assert.throws(
+    () => resolvePiExecutable({ PI_VOT_PI_EXECUTABLE: "pi.cmd" }, "win32", () => true),
+    /must be an absolute path/,
+  );
+  assert.throws(
+    () => resolvePiExecutable(
+      { PI_VOT_PI_EXECUTABLE: "C:\\Pi\\pi.cmd" },
+      "win32",
+      () => false,
+    ),
+    /existing Pi executable/,
+  );
+  assert.equal(
+    resolvePiExecutable(
+      { PI_VOT_PI_EXECUTABLE: "C:\\Pi\\pi.cmd" },
+      "win32",
+      () => true,
+    ),
+    "C:\\Pi\\pi.cmd",
+  );
+});
+
+test("missing Pi produces an actionable installation diagnostic", async () => {
+  const service = new PiService(
+    "/fake/project",
+    undefined,
+    undefined,
+    { env: { PATH: "" }, home: "/fake/home" },
+  );
+  await assert.rejects(
+    service.sendMessage("hello"),
+    /Pi was not found in an absolute PATH directory.*Install Pi.*PI_VOT_PI_EXECUTABLE/,
+  );
+});
 
 interface Command {
   id?: string;
@@ -33,8 +255,16 @@ class FakePiProcess extends EventEmitter {
   readonly commands: Command[] = [];
   exitCode: number | null = null;
   killed = false;
+  shutdownGate?: Promise<void>;
   onCommand: (command: Command) => void = (command) => {
-    this.respond(command, { data: command.type === "prompt" ? { disposition: "started" } : undefined });
+    const data = command.type === "prompt"
+      ? { disposition: "started" }
+      : command.type === "get_state"
+      ? { isStreaming: false, isCompacting: false }
+      : command.type === "get_session_stats"
+      ? { contextUsage: null }
+      : undefined;
+    this.respond(command, { data });
   };
 
   constructor() {
@@ -50,7 +280,9 @@ class FakePiProcess extends EventEmitter {
         }, 5);
       },
     });
-    this.stdin.on("finish", () => this.close(0));
+    this.stdin.on("finish", () => {
+      void (this.shutdownGate ?? Promise.resolve()).then(() => this.close(0));
+    });
     setImmediate(() => this.emit("spawn"));
   }
 
@@ -112,7 +344,7 @@ async function waitFor(predicate: () => boolean, timeoutMs = 1_000): Promise<voi
 }
 
 test("RPC command IDs correlate concurrent commands regardless of response order", async () => {
-  const { child, service } = setup();
+  const { child, service, events } = setup();
   let promptFinished = false;
   let releasePrompt!: () => void;
   const delayedPrompt = new Promise<void>((resolve) => {
@@ -200,6 +432,45 @@ test("native prompt and steer carry structured images only for models with image
   await service.stop();
 });
 
+test("explicit Send, Queue, and Steer use prompt, local FIFO, and steer behavior", async () => {
+  const { child, service, events } = setup();
+  child.onCommand = (command) => {
+    if (command.type === "get_state") {
+      child.respond(command, { data: {
+        model: { provider: "fake", id: "vision", name: "Vision", input: ["text", "image"] },
+        isStreaming: false,
+        isCompacting: false,
+      } });
+    } else if (command.type === "get_session_stats") {
+      child.respond(command, { data: { contextUsage: null } });
+    } else {
+      child.respond(command, { data: command.type === "prompt" ? { disposition: "started" } : undefined });
+    }
+  };
+  const image = { mimeType: "image/png", data: "iVBORw0KGgo=", size: 8 };
+  await assert.rejects(service.sendMessage("wrong mode", "mode-idle-queue", [], "queue"), /not running/);
+  assert.equal(await service.sendMessage("start normally", "mode-send", [], "send"), "started");
+  await assert.rejects(service.sendMessage("late normal send", "mode-busy-send", [], "send"), /already responding/);
+  assert.equal(await service.sendMessage("queue next", "mode-queue", [image], "queue"), "queued");
+  assert.equal(await service.sendMessage("steer now", "mode-steer", [], "steer"), "steered");
+
+  const submitted = child.commands.filter((command) =>
+    ["prompt", "follow_up", "steer"].includes(command.type ?? ""),
+  );
+  assert.deepEqual(submitted.map(({ type, message }) => [type, message]), [
+    ["prompt", "start normally"],
+    ["steer", "steer now"],
+  ]);
+  assert.equal(submitted.some((command) => command.message === "late normal send"), false);
+  assert.deepEqual(service.snapshot().queuedMessages.map(({ id, reason }) => [id, reason]), [["mode-queue", "turn"]]);
+  assert.ok(events.some((event) => event.type === "queued_message" && event.id === "mode-queue" && event.imageCount === 1));
+
+  child.emitRecord({ type: "compaction_start", reason: "manual" });
+  await assert.rejects(service.sendMessage("during compaction", "mode-compacting", [], "steer"), /compacting/);
+  assert.equal(child.commands.some((command) => command.message === "during compaction"), false);
+  await service.stop();
+});
+
 test("non-image models reject image input and compaction queues retain image payloads in FIFO order", async () => {
   const unsupported = setup();
   unsupported.child.onCommand = (command) => {
@@ -235,11 +506,13 @@ test("non-image models reject image input and compaction queues retain image pay
   assert.equal(await service.sendMessage("first", "queue-image-1", [image]), "queued");
   assert.equal(await service.sendMessage("second", "queue-image-2", [image, image]), "queued");
   assert.deepEqual(service.snapshot().queuedMessages, [
-    { id: "queue-image-1", message: "first", imageCount: 1 },
-    { id: "queue-image-2", message: "second", imageCount: 2 },
+    { id: "queue-image-1", message: "first", imageCount: 1, reason: "compaction" },
+    { id: "queue-image-2", message: "second", imageCount: 2, reason: "compaction" },
   ]);
   internal.compacting = false;
   await internal.drainQueuedMessages();
+  child.emitRecord({ type: "agent_settled" });
+  await waitFor(() => child.commands.filter((command) => command.type === "prompt").length === 2);
   assert.deepEqual(child.commands.filter((command) =>
     command.type === "prompt" || command.type === "steer",
   ).map((command) => ({
@@ -248,7 +521,7 @@ test("non-image models reject image input and compaction queues retain image pay
     count: Array.isArray(command.images) ? command.images.length : 0,
   })), [
     { type: "prompt", message: "first", count: 1 },
-    { type: "steer", message: "second", count: 2 },
+    { type: "prompt", message: "second", count: 2 },
   ]);
   await service.stop();
 });
@@ -261,6 +534,9 @@ test("assistant and thinking deltas stream, then canonical message_end content w
   };
   await service.sendMessage("stream");
   child.emitRecord({ type: "message_start", message: { role: "assistant", content: [] } }, true);
+  const assistantStart = events.find((event) => event.type === "assistant_start");
+  assert.ok(assistantStart?.type === "assistant_start");
+  assert.ok(typeof assistantStart.createdAt === "string");
   child.emitRecord({ type: "message_update", assistantMessageEvent: { type: "text_delta", delta: "approx " } }, true);
   child.emitRecord({ type: "message_update", assistantMessageEvent: { type: "thinking_delta", delta: "reason " } });
   child.emitRecord({
@@ -278,6 +554,12 @@ test("assistant and thinking deltas stream, then canonical message_end content w
   assert.ok(service.snapshot().transcript.some((item) =>
     item.type === "assistant" && item.text === "canonical answer" && item.thinking === "canonical reasoning",
   ));
+  const assistantMessage = service.snapshot().transcript.find((item) => item.type === "assistant");
+  assert.equal(assistantMessage?.type, "assistant");
+  if (assistantMessage?.type === "assistant") {
+    assert.equal(typeof assistantMessage.createdAt, "string");
+    assert.equal(assistantMessage.createdAt, assistantStart.createdAt);
+  }
   child.emitRecord({ type: "agent_settled" });
   assert.equal(service.state, "idle");
   assert.ok(events.some((event) => event.type === "assistant_delta" && event.text === "approx "));
@@ -287,6 +569,42 @@ test("assistant and thinking deltas stream, then canonical message_end content w
     event.text === "canonical answer" &&
     event.thinking === "canonical reasoning",
   ));
+  await service.stop();
+});
+
+test("interrupted thinking-only assistant records are discarded during compaction and ignored on reload", async () => {
+  const { child, service, events } = setup();
+  child.onCommand = (command) => {
+    if (command.type === "get_state") {
+      child.respond(command, { data: { isStreaming: false, isCompacting: false } });
+    } else if (command.type === "get_session_stats") {
+      child.respond(command, { data: { contextUsage: null } });
+    } else if (command.type === "get_messages") {
+      child.respond(command, { data: { messages: [
+        { id: "partial", role: "assistant", content: [{ type: "thinking", thinking: "The" }] },
+        { id: "truncated", role: "assistant", stopReason: "length", content: [{ type: "thinking", thinking: "The" }] },
+        { id: "complete", role: "assistant", stopReason: "stop", content: [{ type: "thinking", thinking: "complete thought" }] },
+      ] } });
+    } else {
+      child.respond(command);
+    }
+  };
+  await service.initialize();
+  assert.deepEqual(service.snapshot().transcript.filter((item) => item.type === "assistant").map((item) => item.id), ["complete"]);
+
+  child.emitRecord({ type: "message_start", message: { role: "assistant" } }, true);
+  child.emitRecord({ type: "message_update", assistantMessageEvent: { type: "thinking_delta", delta: "The" } }, true);
+  const firstPartial = [...events].reverse().find((event) => event.type === "assistant_start");
+  assert.ok(firstPartial?.type === "assistant_start");
+  child.emitRecord({ type: "message_start", message: { role: "assistant" } }, true);
+  assert.ok(events.some((event) => event.type === "assistant_discard" && event.messageId === firstPartial.messageId));
+  child.emitRecord({ type: "message_update", assistantMessageEvent: { type: "thinking_delta", delta: "I" } }, true);
+  const secondPartial = [...events].reverse().find((event) => event.type === "assistant_start");
+  assert.ok(secondPartial?.type === "assistant_start");
+  child.emitRecord({ type: "compaction_start", reason: "threshold" }, true);
+  assert.ok(events.some((event) => event.type === "assistant_discard" && event.messageId === secondPartial.messageId));
+  assert.equal(service.snapshot().transcript.some((item) => item.type === "assistant" &&
+    (item.id === "partial" || item.id === firstPartial.messageId || item.id === secondPartial.messageId)), false);
   await service.stop();
 });
 
@@ -335,6 +653,52 @@ test("a handled prompt is not treated as a new assistant response", async () => 
   await service.stop();
 });
 
+test("a newly started runtime initializes state and context RPC without failing", async () => {
+  const { child, service } = setup();
+  child.onCommand = (command) => {
+    if (command.type === "get_state") {
+      child.respond(command, { data: { isStreaming: false, isCompacting: false } });
+    } else if (command.type === "get_session_stats") {
+      child.respond(command, { data: { contextUsage: null } });
+    } else {
+      child.respond(command);
+    }
+  };
+
+  await service.initialize();
+
+  assert.ok(child.commands.some(({ type }) => type === "get_state"));
+  assert.ok(child.commands.some(({ type }) => type === "get_session_stats"));
+  assert.equal(service.state, "idle");
+  await service.stop();
+});
+
+test("initial RPC state failure after child exit rejects initialization with the process error", async () => {
+  const { child, service } = setup();
+  child.onCommand = (command) => {
+    if (command.type === "get_state") child.close(23);
+    else child.respond(command);
+  };
+
+  await assert.rejects(service.initialize(), /Pi exited with code 23/);
+  assert.equal(service.state, "failed");
+  await assert.rejects(service.newSession(), /Pi exited with code 23/);
+  await service.stop();
+});
+
+test("an established runtime tolerates advisory metadata refresh failures", async () => {
+  const { child, service } = setup();
+  await service.initialize();
+  child.onCommand = (command) => {
+    child.respond(command, { success: false, error: "Temporary metadata failure." });
+  };
+
+  await service.refreshPersistedState();
+
+  assert.equal(service.state, "idle");
+  await service.stop();
+});
+
 test("agent_end does not settle; agent_settled does", async () => {
   const { child, service } = setup();
   child.onCommand = (command) => {
@@ -346,6 +710,89 @@ test("agent_end does not settle; agent_settled does", async () => {
   assert.equal(service.state, "running");
   child.emitRecord({ type: "agent_settled" });
   assert.equal(service.state, "idle");
+  await service.stop();
+});
+
+test("regular queued messages run as separate turns in FIFO order", async () => {
+  const { child, service, events } = setup();
+  let isStreaming = false;
+  const promptMessages: string[] = [];
+  child.onCommand = (command) => {
+    if (command.type === "prompt") {
+      promptMessages.push(String(command.message));
+      isStreaming = true;
+      child.emitRecord({ type: "agent_start" });
+      child.respond(command, { data: { disposition: "started" } });
+    } else if (command.type === "get_state") {
+      child.respond(command, { data: { isStreaming, isCompacting: false } });
+    } else {
+      child.respond(command);
+    }
+  };
+  await service.sendMessage("current turn", "current-id");
+  await service.sendMessage("first queued", "queue-one", [], "queue");
+  await service.sendMessage("second queued", "queue-two", [], "queue");
+  assert.deepEqual(service.snapshot().queuedMessages.map(({ id, reason }) => [id, reason]), [
+    ["queue-one", "turn"],
+    ["queue-two", "turn"],
+  ]);
+
+  isStreaming = false;
+  child.emitRecord({ type: "agent_settled" });
+  await waitFor(() => promptMessages.length === 2);
+  assert.deepEqual(promptMessages, ["current turn", "first queued"]);
+  assert.deepEqual(events.filter((event) => event.type === "queued_message_sent").map((event) => event.id), ["queue-one"]);
+
+  isStreaming = false;
+  child.emitRecord({ type: "agent_settled" });
+  await waitFor(() => promptMessages.length === 3);
+  await waitFor(() => events.filter((event) => event.type === "queued_message_sent").length === 2);
+  assert.deepEqual(promptMessages, ["current turn", "first queued", "second queued"]);
+  assert.deepEqual(events.filter((event) => event.type === "queued_message_sent").map((event) => event.id), ["queue-one", "queue-two"]);
+  isStreaming = false;
+  child.emitRecord({ type: "agent_settled" });
+  await waitFor(() => service.snapshot().queuedMessages.length === 0);
+  await service.stop();
+});
+
+test("compaction hides Pi's internal assistant messages and anchors history to the prior turn", async () => {
+  const { child, service, events } = setup();
+  child.onCommand = (command) => {
+    if (command.type === "prompt") {
+      child.emitRecord({ type: "agent_start" });
+      child.respond(command, { data: {
+        disposition: "started",
+        message: { id: "pi-user-anchor", timestamp: new Date().toISOString() },
+      } });
+    } else if (command.type === "compact") {
+      child.emitRecord({ type: "compaction_start", reason: "manual" });
+      child.emitRecord({ type: "message_start", message: { role: "assistant", content: [] } });
+      child.emitRecord({ type: "message_update", assistantMessageEvent: { type: "text_delta", delta: "internal summary" } });
+      child.emitRecord({ type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "internal summary" }] } });
+      child.emitRecord({
+        type: "compaction_end",
+        reason: "manual",
+        result: { summary: "internal", tokensBefore: 10_000, estimatedTokensAfter: 2_000 },
+        aborted: false,
+        willRetry: false,
+      });
+      child.respond(command, { data: { summary: "internal" } });
+    } else {
+      child.respond(command, { data: command.type === "get_state"
+        ? { isStreaming: false, isCompacting: false }
+        : command.type === "get_session_stats" ? { contextUsage: null } : undefined });
+    }
+  };
+  await service.sendMessage("preserve this turn", "anchor-user");
+  await service.compact();
+  await waitFor(() => events.some((event) => event.type === "compaction_end" && event.success));
+  assert.equal(events.some((event) => event.type === "assistant_start" || event.type === "assistant_delta" || event.type === "assistant_end"), false);
+  assert.equal(service.snapshot().transcript.some((item) => item.type === "assistant" && item.text === "internal summary"), false);
+  const completion = events.find((event) => event.type === "compaction_end" && event.success);
+  assert.ok(completion?.type === "compaction_end" && completion.entry?.anchorId === "anchor-user");
+  assert.equal(completion?.type === "compaction_end" ? completion.entry?.reason : undefined, "manual");
+  assert.equal(completion?.type === "compaction_end" ? completion.entry?.tokensBefore : undefined, 10_000);
+  assert.equal(completion?.type === "compaction_end" ? completion.entry?.estimatedTokensAfter : undefined, 2_000);
   await service.stop();
 });
 
@@ -414,7 +861,14 @@ test("abort settles the session and the same Pi process accepts another prompt",
   child.onCommand = (command) => {
     if (command.type === "prompt") child.emitRecord({ type: "agent_start" });
     if (command.type === "abort") child.emitRecord({ type: "agent_settled" });
-    child.respond(command, { data: command.type === "prompt" ? { disposition: "started" } : undefined });
+    const data = command.type === "prompt"
+      ? { disposition: "started" }
+      : command.type === "get_state"
+      ? { isStreaming: false, isCompacting: false }
+      : command.type === "get_session_stats"
+      ? { contextUsage: null }
+      : undefined;
+    child.respond(command, { data });
   };
   await service.sendMessage("first");
   await service.abort();
@@ -431,7 +885,14 @@ test("shutdown aborts active work, closes RPC input, and waits for the child", a
   child.onCommand = (command) => {
     if (command.type === "prompt") child.emitRecord({ type: "agent_start" });
     if (command.type === "abort") child.emitRecord({ type: "agent_settled" });
-    child.respond(command, { data: command.type === "prompt" ? { disposition: "started" } : undefined });
+    const data = command.type === "prompt"
+      ? { disposition: "started" }
+      : command.type === "get_state"
+      ? { isStreaming: false, isCompacting: false }
+      : command.type === "get_session_stats"
+      ? { contextUsage: null }
+      : undefined;
+    child.respond(command, { data });
   };
   await service.sendMessage("active");
   await service.stop();
@@ -529,6 +990,36 @@ test("model listing and switching use native Pi RPC and refresh model/context st
   await service.stop();
 });
 
+test("prompt template discovery returns only Pi prompt commands and submission preserves all arguments", async () => {
+  const { child, service } = setup();
+  child.onCommand = (command) => {
+    if (command.type === "get_state") {
+      child.respond(command, { data: { model: { provider: "test", id: "model" }, isStreaming: false, isCompacting: false } });
+    } else if (command.type === "get_session_stats") {
+      child.respond(command, { data: { contextUsage: null } });
+    } else if (command.type === "get_commands") {
+      child.respond(command, { data: { commands: [
+        { name: "review", description: "Review changes", source: "prompt" },
+        { name: "skill:security", description: "Security review", source: "skill" },
+        { name: "extension-command", description: "Extension command", source: "extension" },
+        { name: "invalid name", source: "prompt" },
+      ] } });
+    } else {
+      child.respond(command, { data: command.type === "prompt" ? { disposition: "started" } : undefined });
+    }
+  };
+
+  await service.initialize();
+  assert.deepEqual(await service.getPromptTemplates(), [
+    { name: "review", description: "Review changes" },
+  ]);
+  const templatePrompt = '/review src/file.ts "API compatibility" extra context';
+  await service.sendMessage(templatePrompt, "template-prompt");
+  const prompt = child.commands.find((command) => command.type === "prompt");
+  assert.equal(prompt?.message, templatePrompt);
+  await service.stop();
+});
+
 test("failed or busy model changes do not overwrite Pi's current model", async () => {
   const { child, service } = setup();
   const original = { provider: "test", id: "unchanged", name: "Unchanged" };
@@ -551,6 +1042,31 @@ test("failed or busy model changes do not overwrite Pi's current model", async (
   assert.equal(child.commands.some((command) => command.type === "set_model"), true);
   assert.equal(child.commands.filter((command) => command.type === "set_model").length, 1);
   await service.abort();
+  await service.stop();
+});
+
+test("queued messages can be cancelled individually or cleared as a group", async () => {
+  const { child, service, events } = setup();
+  child.onCommand = (command) => {
+    if (command.type === "prompt") {
+      child.emitRecord({ type: "agent_start" });
+      child.respond(command, { data: { disposition: "started" } });
+    } else {
+      child.respond(command, { data: { isStreaming: true, isCompacting: false } });
+    }
+  };
+  await service.sendMessage("active turn", "cancel-active");
+  await service.sendMessage("keep this queued", "cancel-one", [], "queue");
+  await service.sendMessage("cancel this queued message", "cancel-two", [], "queue");
+  await service.sendMessage("clear this queued message", "cancel-three", [], "queue");
+
+  assert.equal(service.cancelQueuedMessage("cancel-two"), true);
+  assert.deepEqual(service.snapshot().queuedMessages.map(({ id }) => id), ["cancel-one", "cancel-three"]);
+  assert.deepEqual(service.clearQueuedMessages(), ["cancel-three", "cancel-one"]);
+  assert.deepEqual(service.snapshot().queuedMessages, []);
+  assert.deepEqual(events.filter((event) => event.type === "queued_message_cancelled").map((event) => event.id), [
+    "cancel-two", "cancel-three", "cancel-one",
+  ]);
   await service.stop();
 });
 
@@ -646,11 +1162,169 @@ test("a retrying compaction keeps the automatic-compaction queue until final com
     aborted: false,
     willRetry: false,
   });
+  child.emitRecord({ type: "agent_settled" });
   await waitFor(() => events.some((event) =>
     event.type === "queued_message_sent" && event.id === "retry-queue",
   ));
   assert.equal(child.commands.filter((command) => command.type === "prompt").length, 1);
   assert.equal(events.filter((event) => event.type === "queued_message_sent" && event.id === "retry-queue").length, 1);
+  await service.stop();
+});
+
+test("agent settlement and authoritative idle state recover a missing compaction completion without recording success", async () => {
+  const { child, service, events } = setup();
+  let isStreaming = false;
+  let isCompacting = false;
+  let promptCalls = 0;
+  child.onCommand = (command) => {
+    if (command.type === "get_state") {
+      child.respond(command, { data: { isStreaming, isCompacting } });
+    } else if (command.type === "get_session_stats") {
+      child.respond(command, { data: { contextUsage: null } });
+    } else if (command.type === "prompt") {
+      promptCalls++;
+      child.respond(command, { data: { disposition: "started" } });
+    } else {
+      child.respond(command);
+    }
+  };
+
+  await service.initialize();
+  isStreaming = true;
+  isCompacting = true;
+  child.emitRecord({ type: "agent_start" });
+  child.emitRecord({ type: "compaction_start", reason: "threshold" });
+  await service.sendMessage("send after stale compaction", "stale-queue");
+
+  isStreaming = false;
+  isCompacting = false;
+  child.emitRecord({ type: "agent_settled" });
+  await waitFor(() => events.some((event) =>
+    event.type === "queued_message_sent" && event.id === "stale-queue",
+  ));
+
+  assert.equal(service.snapshot().isCompacting, false);
+  assert.equal(service.snapshot().queuedMessages.length, 0);
+  assert.equal(service.snapshot().transcript.filter((item) => item.type === "compaction").length, 0);
+  assert.equal(events.filter((event) => event.type === "queued_message_sent" && event.id === "stale-queue").length, 1);
+  assert.equal(promptCalls, 1);
+  await service.stop();
+});
+
+test("willRetry holds queued messages through the agent retry delay and resumed request", async () => {
+  const { child, service, events } = setup();
+  let isStreaming = false;
+  let isCompacting = false;
+  let promptCalls = 0;
+  child.onCommand = (command) => {
+    if (command.type === "get_state") {
+      child.respond(command, { data: { isStreaming, isCompacting } });
+    } else if (command.type === "get_session_stats") {
+      child.respond(command, { data: { contextUsage: null } });
+    } else if (command.type === "prompt") {
+      promptCalls++;
+      child.respond(command, { data: { disposition: "started" } });
+    } else {
+      child.respond(command);
+    }
+  };
+
+  await service.initialize();
+  isStreaming = true;
+  isCompacting = true;
+  child.emitRecord({ type: "agent_start" });
+  child.emitRecord({ type: "compaction_start", reason: "overflow" });
+  await service.sendMessage("send after retry settles", "retry-settle-queue");
+
+  isStreaming = false;
+  isCompacting = false;
+  child.emitRecord({
+    type: "compaction_end",
+    reason: "overflow",
+    result: { summary: "compacted", tokensBefore: 10_000, estimatedTokensAfter: 2_000 },
+    aborted: false,
+    willRetry: true,
+  });
+  await new Promise((resolve) => setTimeout(resolve, 300));
+  assert.equal(service.snapshot().isCompacting, true);
+  assert.deepEqual(service.snapshot().queuedMessages.map(({ id }) => id), ["retry-settle-queue"]);
+  assert.equal(promptCalls, 0);
+
+  isStreaming = true;
+  child.emitRecord({ type: "agent_start" });
+  await new Promise((resolve) => setTimeout(resolve, 300));
+  assert.equal(service.snapshot().isCompacting, true);
+  assert.equal(promptCalls, 0);
+
+  isStreaming = false;
+  child.emitRecord({ type: "agent_settled" });
+  await waitFor(() => events.some((event) =>
+    event.type === "queued_message_sent" && event.id === "retry-settle-queue",
+  ));
+  assert.equal(service.snapshot().isCompacting, false);
+  assert.equal(service.snapshot().transcript.filter((item) => item.type === "compaction").length, 1);
+  assert.equal(events.filter((event) => event.type === "queued_message_sent" && event.id === "retry-settle-queue").length, 1);
+  assert.equal(promptCalls, 1);
+  await service.stop();
+});
+
+test("a stale reconciliation response cannot clear a newer compaction", async () => {
+  const { child, service, events } = setup();
+  let isStreaming = false;
+  let isCompacting = false;
+  let holdState = false;
+  const delayedStates: Command[] = [];
+  let promptCalls = 0;
+  child.onCommand = (command) => {
+    if (command.type === "get_state") {
+      if (holdState) delayedStates.push(command);
+      else child.respond(command, { data: { isStreaming, isCompacting } });
+    } else if (command.type === "get_session_stats") {
+      child.respond(command, { data: { contextUsage: null } });
+    } else if (command.type === "prompt") {
+      promptCalls++;
+      child.respond(command, { data: { disposition: "started" } });
+    } else {
+      child.respond(command);
+    }
+  };
+
+  await service.initialize();
+  isCompacting = true;
+  child.emitRecord({ type: "compaction_start", reason: "threshold" });
+  await service.sendMessage("remain queued for newer compaction", "newer-compaction-queue");
+  isCompacting = false;
+  holdState = true;
+  child.emitRecord({ type: "agent_settled" });
+  await waitFor(() => delayedStates.length === 1);
+
+  isStreaming = true;
+  isCompacting = true;
+  child.emitRecord({ type: "compaction_start", reason: "overflow" });
+  child.respond(delayedStates.shift()!, { data: { isStreaming: false, isCompacting: false } });
+  await waitFor(() => delayedStates.length === 1);
+  child.respond(delayedStates.shift()!, { data: { isStreaming, isCompacting } });
+  await waitFor(() => service.snapshot().isCompacting);
+  assert.equal(promptCalls, 0);
+  assert.deepEqual(service.snapshot().queuedMessages.map(({ id }) => id), ["newer-compaction-queue"]);
+
+  holdState = false;
+  isStreaming = false;
+  isCompacting = false;
+  child.emitRecord({
+    type: "compaction_end",
+    reason: "overflow",
+    result: { summary: "newer compaction", tokensBefore: 12_000, estimatedTokensAfter: 3_000 },
+    aborted: false,
+    willRetry: false,
+  });
+  child.emitRecord({ type: "agent_settled" });
+  await waitFor(() => events.some((event) =>
+    event.type === "queued_message_sent" && event.id === "newer-compaction-queue",
+  ));
+  assert.equal(service.snapshot().isCompacting, false);
+  assert.equal(events.filter((event) => event.type === "queued_message_sent" && event.id === "newer-compaction-queue").length, 1);
+  assert.equal(promptCalls, 1);
   await service.stop();
 });
 
@@ -714,18 +1388,56 @@ test("manual compaction uses Pi RPC and drains queued messages once, in FIFO ord
     willRetry: false,
   });
   child.respond(compactCommand!, { data: { summary: "not shown" } });
+  await waitFor(() => events.filter((event) => event.type === "queued_message_sent").length === 1);
+  assert.deepEqual(child.commands
+    .filter((command) => command.type === "prompt" || command.type === "steer")
+    .map((command) => [command.type, command.message]), [
+      ["prompt", "first queued message"],
+    ]);
+  assert.deepEqual(service.snapshot().queuedMessages.map(({ id }) => id), ["queue-2"]);
+  isStreaming = false;
+  child.emitRecord({ type: "agent_settled" });
   await waitFor(() => events.filter((event) => event.type === "queued_message_sent").length === 2);
   assert.deepEqual(child.commands
     .filter((command) => command.type === "prompt" || command.type === "steer")
     .map((command) => [command.type, command.message]), [
       ["prompt", "first queued message"],
-      ["steer", "second queued message"],
+      ["prompt", "second queued message"],
     ]);
   assert.deepEqual(events.filter((event) => event.type === "queued_message_sent").map((event) => event.id), [
     "queue-1",
     "queue-2",
   ]);
   assert.equal(service.snapshot().context.tokens, 32_000);
+  assert.equal(service.snapshot().isCompacting, false);
+  isStreaming = false;
+  child.emitRecord({ type: "agent_settled" });
+  await service.stop();
+});
+
+test("manual compaction below the keep-recent threshold does not interrupt an active turn", async () => {
+  const { child, service, events } = setup();
+  let isStreaming = false;
+  child.onCommand = (command) => {
+    if (command.type === "get_state") {
+      child.respond(command, { data: { isStreaming, isCompacting: false } });
+    } else if (command.type === "get_session_stats") {
+      child.respond(command, { data: { contextUsage: { tokens: 19_999, contextWindow: 128_000, percent: 15.6 } } });
+    } else if (command.type === "prompt") {
+      isStreaming = true;
+      child.emitRecord({ type: "agent_start" });
+      child.respond(command, { data: { disposition: "started" } });
+    } else {
+      child.respond(command);
+    }
+  };
+
+  await service.initialize();
+  await service.sendMessage("keep working", "active-user");
+  await assert.rejects(service.compact(), /Nothing to compact yet/);
+  assert.equal(isStreaming, true);
+  assert.equal(child.commands.some((command) => command.type === "compact" || command.type === "abort"), false);
+  assert.equal(events.some((event) => event.type === "compaction_start"), false);
   assert.equal(service.snapshot().isCompacting, false);
   await service.stop();
 });
@@ -765,6 +1477,8 @@ test("automatic compaction and failed or aborted endings clear state and retain 
     errorMessage: "summary provider temporarily unavailable",
     willRetry: false,
   });
+  isStreaming = false;
+  child.emitRecord({ type: "agent_settled" });
   await waitFor(() => events.some((event) =>
     event.type === "queued_message_sent" && event.id === "auto-queue",
   ));
@@ -781,6 +1495,7 @@ test("automatic compaction and failed or aborted endings clear state and retain 
   await service.sendMessage("survives aborted compaction", "abort-queue");
   isCompacting = false;
   child.emitRecord({ type: "compaction_end", reason: "overflow", aborted: true, willRetry: false });
+  child.emitRecord({ type: "agent_settled" });
   await waitFor(() => events.some((event) =>
     event.type === "queued_message_sent" && event.id === "abort-queue",
   ));
@@ -819,6 +1534,7 @@ test("Pi's session-too-small compaction result is informational and leaves the s
   };
 
   await service.initialize();
+  (service as unknown as { manualCompactionKeepRecentTokens: number }).manualCompactionKeepRecentTokens = 0;
   await service.compact();
   await waitFor(() => events.some((event) => event.type === "compaction_end"));
 
@@ -830,12 +1546,555 @@ test("Pi's session-too-small compaction result is informational and leaves the s
   assert.equal(service.snapshot().isCompacting, false);
   assert.equal(service.state, "idle");
   assert.deepEqual(service.snapshot().context, { tokens: 12_000, contextWindow: 200_000, percent: 6 });
+  assert.equal(service.snapshot().transcript.filter((item) => item.type === "compaction").length, 0);
   assert.equal(compactCalls, 1);
 
   assert.equal(await service.sendMessage("session remains usable"), "started");
   assert.equal(child.commands.filter((command) => command.type === "prompt").length, 1);
   assert.equal(compactCalls, 1);
   await service.stop();
+});
+
+test("context usage refreshes after messages, assistant completion, tool activity, and compaction", async () => {
+  const { child, service, events } = setup();
+  let tokens = 100;
+  let isCompacting = false;
+  child.onCommand = (command) => {
+    if (command.type === "get_state") {
+      child.respond(command, { data: { isStreaming: false, isCompacting } });
+    } else if (command.type === "get_session_stats") {
+      child.respond(command, { data: { contextUsage: { tokens, contextWindow: 10_000, percent: tokens / 100 } } });
+    } else if (command.type === "prompt") {
+      child.respond(command, { data: { disposition: "started" } });
+    } else if (command.type === "compact") {
+      isCompacting = true;
+      child.respond(command);
+      setTimeout(() => {
+        isCompacting = false;
+        tokens = 600;
+        child.emitRecord({ type: "compaction_end", result: { summary: "compacted" }, aborted: false });
+        child.emitRecord({ type: "agent_settled" });
+      }, 20);
+    } else {
+      child.respond(command);
+    }
+  };
+
+  await service.initialize();
+  (service as unknown as { manualCompactionKeepRecentTokens: number }).manualCompactionKeepRecentTokens = 0;
+  tokens = 200;
+  await service.sendMessage("accepted message", "context-message");
+  await waitFor(() => service.snapshot().context.tokens === 200);
+  assert.ok(events.some((event) => event.type === "user_message" && event.messageId === "context-message"));
+
+  child.emitRecord({ type: "message_start", message: { role: "assistant", content: [] } });
+  tokens = 300;
+  child.emitRecord({
+    type: "message_end",
+    message: { role: "assistant", content: [{ type: "text", text: "Answer" }] },
+  });
+  await waitFor(() => service.snapshot().context.tokens === 300);
+
+  tokens = 350;
+  child.emitRecord({ type: "agent_settled" });
+  await waitFor(() => service.snapshot().context.tokens === 350);
+
+  tokens = 400;
+  child.emitRecord({ type: "tool_execution_end", toolCallId: "context-tool", toolName: "read", result: {} });
+  await waitFor(() => service.snapshot().context.tokens === 400);
+
+  tokens = 500;
+  await service.compact();
+  await waitFor(() => service.snapshot().context.tokens === 500);
+  await waitFor(() => events.some((event) => event.type === "compaction_end"));
+  assert.equal(service.snapshot().context.tokens, 600);
+  await service.stop();
+});
+
+test("successful compaction history persists once and reconstructs across session hydration", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-vot-compaction-history-"));
+  const sessionFile = join(root, "session.jsonl");
+  const createdAt = "2026-10-06T21:00:00.000Z";
+  const user = { role: "user", content: "Earlier message", timestamp: Date.parse(createdAt) };
+  const assistant = { role: "assistant", content: [{ type: "text", text: "Earlier answer" }] };
+  await writeFile(sessionFile, [
+    JSON.stringify({ type: "session", id: "session-1", cwd: "/fake/project" }),
+    JSON.stringify({ type: "message", id: "user-1", timestamp: createdAt, message: user }),
+    JSON.stringify({ type: "message", id: "assistant-1", timestamp: "2026-10-06T21:01:00.000Z", message: assistant }),
+    "",
+  ].join("\n"));
+  const { child, service, events } = setup();
+  let isCompacting = false;
+  child.onCommand = (command) => {
+    if (command.type === "get_state") {
+      child.respond(command, { data: { sessionFile, isStreaming: false, isCompacting } });
+    } else if (command.type === "get_session_stats") {
+      child.respond(command, { data: { contextUsage: { tokens: 50, contextWindow: 10_000, percent: 0.5 } } });
+    } else if (command.type === "get_messages") {
+      child.respond(command, { data: { messages: [user, assistant] } });
+    } else if (command.type === "compact") {
+      isCompacting = true;
+      child.respond(command);
+      setTimeout(() => {
+        isCompacting = false;
+        child.emitRecord({
+          type: "compaction_end",
+          reason: "manual",
+          result: { summary: "done", tokensBefore: 8_000, estimatedTokensAfter: 2_000 },
+          aborted: false,
+        });
+      }, 20);
+    } else {
+      child.respond(command);
+    }
+  };
+
+  try {
+    await service.initialize();
+    (service as unknown as { manualCompactionKeepRecentTokens: number }).manualCompactionKeepRecentTokens = 0;
+    await service.compact();
+    await waitFor(() => events.some((event) => event.type === "compaction_end"));
+    const entry = service.snapshot().transcript.filter((item) => item.type === "compaction");
+    assert.equal(entry.length, 1);
+    assert.equal(entry[0]?.type, "compaction");
+    assert.equal(entry[0]?.type === "compaction" ? entry[0].reason : undefined, "manual");
+    assert.equal(entry[0]?.type === "compaction" ? entry[0].tokensBefore : undefined, 8_000);
+    assert.equal(entry[0]?.type === "compaction" ? entry[0].estimatedTokensAfter : undefined, 2_000);
+    assert.equal(events.filter((event) => event.type === "compaction_end" && event.entry).length, 1);
+
+    isCompacting = true;
+    child.emitRecord({ type: "compaction_start", reason: "threshold" });
+    isCompacting = false;
+    child.emitRecord({ type: "compaction_end", reason: "threshold", result: { summary: "automatic" }, aborted: false });
+    child.emitRecord({ type: "agent_settled" });
+    await waitFor(() => events.filter((event) => event.type === "compaction_end" && event.entry).length === 2);
+
+    child.emitRecord({ type: "compaction_end", result: { summary: "duplicate callback" }, aborted: false });
+    await service.refreshPersistedState();
+    assert.equal(service.snapshot().transcript.filter((item) => item.type === "compaction").length, 2);
+
+    const hydrated = await hydratePiSession({
+      id: sessionFile,
+      cwd: "/fake/project",
+      name: null,
+      preview: "Earlier message",
+      updatedAt: createdAt,
+    });
+    assert.equal(hydrated.transcript.filter((item) => item.type === "compaction").length, 2);
+    const reloadedUser = hydrated.transcript.find((item) => item.type === "user");
+    const reloadedAssistant = hydrated.transcript.find((item) => item.type === "assistant");
+    assert.equal(reloadedUser?.type === "user" ? reloadedUser.createdAt : undefined, createdAt);
+    assert.equal(
+      reloadedAssistant?.type === "assistant" ? reloadedAssistant.createdAt : undefined,
+      "2026-10-06T21:01:00.000Z",
+    );
+    const persistedEntry = hydrated.transcript.find((item) => item.type === "compaction");
+    assert.equal(persistedEntry?.type === "compaction" ? persistedEntry.reason : undefined, "manual");
+    assert.equal(persistedEntry?.type === "compaction" ? persistedEntry.tokensBefore : undefined, 8_000);
+    assert.equal(persistedEntry?.type === "compaction" ? persistedEntry.estimatedTokensAfter : undefined, 2_000);
+    assert.equal(persistedEntry?.type === "compaction" ? persistedEntry.createdAt : undefined,
+      entry[0]?.type === "compaction" ? entry[0].createdAt : undefined);
+    assert.ok(persistedEntry?.type === "compaction" &&
+      hydrated.transcript.some((item) => item.id === persistedEntry.anchorId),
+    JSON.stringify({ persistedEntry, transcript: hydrated.transcript }));
+  } finally {
+    await service.stop();
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("legacy persisted messages without timestamps still hydrate without fabricated times", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-vot-legacy-timestamp-"));
+  const sessionFile = join(root, "legacy.jsonl");
+  await writeFile(sessionFile, [
+    JSON.stringify({ type: "session", id: "legacy", cwd: "/fake/project" }),
+    JSON.stringify({ type: "message", id: "legacy-message", message: { role: "user", content: "Untimed legacy message" } }),
+    "",
+  ].join("\n"));
+  try {
+    const hydrated = await hydratePiSession({
+      id: sessionFile,
+      cwd: "/fake/project",
+      name: null,
+      preview: "Untimed legacy message",
+      updatedAt: new Date().toISOString(),
+    });
+    assert.equal(hydrated.transcript[0]?.type, "user");
+    assert.equal(hydrated.transcript[0]?.type === "user" ? hydrated.transcript[0].createdAt : undefined, undefined);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("inactive transcript hydration follows only the persisted session-tree branch", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-vot-history-branch-"));
+  const sessionFile = join(root, "branch.jsonl");
+  const entries = [
+    { type: "session", id: "branch-session", cwd: "/fake/project" },
+    { type: "message", id: "root-user", parentId: null, timestamp: "2026-10-06T10:00:00.000Z", message: { role: "user", content: "Root prompt" } },
+    { type: "message", id: "root-assistant", parentId: "root-user", timestamp: "2026-10-06T10:00:01.000Z", message: { role: "assistant", content: [{ type: "text", text: "Root answer" }] } },
+    { type: "message", id: "branch-a-user", parentId: "root-assistant", message: { role: "user", content: "Branch A prompt" } },
+    { type: "message", id: "branch-a-assistant", parentId: "branch-a-user", message: { role: "assistant", content: [{ type: "text", text: "Branch A answer" }] } },
+    { type: "message", id: "branch-b-user", parentId: "root-assistant", timestamp: "2026-10-06T11:00:00.000Z", message: { role: "user", content: "Branch B prompt" } },
+    {
+      type: "message",
+      id: "branch-b-assistant",
+      parentId: "branch-b-user",
+      timestamp: "2026-10-06T11:00:01.000Z",
+      message: {
+        role: "assistant",
+        content: [{ type: "text", text: "Branch B answer" }, { type: "toolCall", id: "branch-tool", name: "read", arguments: { path: "file" } }],
+      },
+    },
+    {
+      type: "message",
+      id: "branch-tool-result",
+      parentId: "branch-b-assistant",
+      timestamp: "2026-10-06T11:00:02.000Z",
+      message: { role: "toolResult", toolCallId: "branch-tool", toolName: "read", content: "Branch B tool result" },
+    },
+  ];
+  await writeFile(sessionFile, `${entries.map((entry) => JSON.stringify(entry)).join("\n")}\n`);
+  await writeFile(`${sessionFile}.pi-vot.jsonl`, [
+    {
+      type: "compaction",
+      id: "compaction-branch-a",
+      createdAt: "2026-10-06T10:01:00.000Z",
+      afterId: "branch-a-assistant",
+      afterIndex: 3,
+    },
+    {
+      type: "compaction",
+      id: "compaction-branch",
+      createdAt: "2026-10-06T11:01:00.000Z",
+      afterId: "branch-b-assistant",
+      afterIndex: 3,
+    },
+  ].map((entry) => JSON.stringify(entry)).join("\n") + "\n");
+  try {
+    const hydrated = await hydratePiSession({
+      id: sessionFile,
+      cwd: "/fake/project",
+      name: null,
+      preview: "Root prompt",
+      updatedAt: new Date().toISOString(),
+    });
+    assert.deepEqual(hydrated.transcript.map((item) => item.id), [
+      "root-user",
+      "root-assistant",
+      "branch-b-user",
+      "branch-b-assistant",
+      "compaction-branch",
+      "tool-branch-tool",
+    ]);
+    assert.equal(hydrated.transcript.some((item) =>
+      (item.type === "user" || item.type === "assistant") && item.text.includes("Branch A")), false);
+    assert.equal(hydrated.transcript[0]?.type === "user" ? hydrated.transcript[0].createdAt : undefined,
+      "2026-10-06T10:00:00.000Z");
+    const tool = hydrated.transcript.at(-1);
+    assert.equal(tool?.type === "tool" ? tool.output : undefined, "Branch B tool result");
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("locally synthesized message timestamps persist and authoritative Pi times win on reload", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-vot-timestamp-fallback-"));
+  const sessionFile = join(root, "fallback.jsonl");
+  await writeFile(sessionFile, `${JSON.stringify({ type: "session", id: "fallback", cwd: "/fake/project" })}\n`);
+  const user = { id: "pi-user-1", role: "user", content: "Fallback user" };
+  const assistant = { id: "pi-assistant-1", role: "assistant", content: [{ type: "text", text: "Fallback assistant" }] };
+  const { child, service } = setup();
+  let messages: unknown[] = [];
+  child.onCommand = (command) => {
+    if (command.type === "get_state") {
+      child.respond(command, { data: { sessionFile, isStreaming: false, isCompacting: false } });
+    } else if (command.type === "get_session_stats") {
+      child.respond(command, { data: { contextUsage: null } });
+    } else if (command.type === "get_messages") {
+      child.respond(command, { data: { messages } });
+    } else if (command.type === "prompt") {
+      messages = [user];
+      child.respond(command, { data: { disposition: "started", messageId: "pi-user-1" } });
+    } else {
+      child.respond(command);
+    }
+  };
+
+  try {
+    await service.initialize();
+    await service.sendMessage("Fallback user", "local-user-id");
+    const userTimestamp = service.snapshot().transcript.find((item) =>
+      item.type === "user" && item.id === "local-user-id",
+    );
+    assert.equal(userTimestamp?.type === "user" ? typeof userTimestamp.createdAt : false, "string");
+    assert.ok(userTimestamp?.type === "user" && userTimestamp.createdAt);
+
+    child.emitRecord({ type: "message_start", message: assistant });
+    child.emitRecord({ type: "message_end", message: assistant });
+    const assistantTimestamp = service.snapshot().transcript.find((item) => item.type === "assistant");
+    assert.equal(assistantTimestamp?.type === "assistant" ? typeof assistantTimestamp.createdAt : false, "string");
+
+    messages = [user, assistant];
+    await service.refreshPersistedState();
+    await writeFile(sessionFile, [
+      JSON.stringify({ type: "session", id: "fallback", cwd: "/fake/project" }),
+      JSON.stringify({ type: "message", id: "pi-user-1", message: user }),
+      JSON.stringify({ type: "message", id: "pi-assistant-1", message: assistant }),
+      "",
+    ].join("\n"));
+    const hydrated = await hydratePiSession({
+      id: sessionFile,
+      cwd: "/fake/project",
+      name: null,
+      preview: "Fallback user",
+      updatedAt: new Date().toISOString(),
+    });
+    const reloadedUser = hydrated.transcript.find((item) => item.type === "user");
+    const reloadedAssistant = hydrated.transcript.find((item) => item.type === "assistant");
+    assert.equal(reloadedUser?.type === "user" ? reloadedUser.createdAt : undefined,
+      userTimestamp?.type === "user" ? userTimestamp.createdAt : undefined);
+    assert.equal(reloadedAssistant?.type === "assistant" ? reloadedAssistant.createdAt : undefined,
+      assistantTimestamp?.type === "assistant" ? assistantTimestamp.createdAt : undefined);
+
+    const metadataPath = `${sessionFile}.pi-vot.jsonl`;
+    const fallbackRecords = (await readFile(metadataPath, "utf8")).trim().split("\n").map((line) => JSON.parse(line));
+    assert.equal(fallbackRecords.filter((item) => item.type === "timestamp_fallback").length, 2);
+    assert.ok(fallbackRecords.some((item) => item.piMessageId === "pi-user-1"));
+
+    const authoritativeTime = "2026-10-06T22:00:00.000Z";
+    await writeFile(sessionFile, [
+      JSON.stringify({ type: "session", id: "fallback", cwd: "/fake/project" }),
+      JSON.stringify({ type: "message", id: "pi-user-1", message: { ...user, timestamp: authoritativeTime } }),
+      JSON.stringify({ type: "message", id: "pi-assistant-1", message: assistant }),
+      "",
+    ].join("\n"));
+    await appendFile(metadataPath, [
+      "malformed record",
+      JSON.stringify({
+        type: "compaction",
+        id: "compaction-old-format",
+        createdAt: "2026-10-06T21:59:00.000Z",
+        afterId: "pi-user-1",
+        afterIndex: 0,
+      }),
+      JSON.stringify({
+        type: "timestamp_fallback",
+        localId: "conflicting-authoritative-user",
+        role: "user",
+        piMessageId: "pi-user-1",
+        contentHash: createHash("sha256").update("user\0Fallback user").digest("hex"),
+        createdAt: "2020-01-01T00:00:00.000Z",
+      }),
+      "\n",
+    ].join("\n"));
+    const authoritativeReload = await hydratePiSession({
+      id: sessionFile,
+      cwd: "/fake/project",
+      name: null,
+      preview: "Fallback user",
+      updatedAt: new Date().toISOString(),
+    });
+    const authoritativeUser = authoritativeReload.transcript.find((item) => item.type === "user");
+    assert.equal(authoritativeUser?.type === "user" ? authoritativeUser.createdAt : undefined, authoritativeTime);
+    assert.equal(authoritativeReload.transcript.filter((item) => item.type === "compaction").length, 1);
+  } finally {
+    await service.stop();
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("repeated identical messages keep fallback timestamps attached to persisted Pi IDs after transcript changes", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-vot-repeated-timestamps-"));
+  const sessionFile = join(root, "repeated.jsonl");
+  const repeated = { role: "user", content: "Repeat this" };
+  const hash = createHash("sha256").update("user\0Repeat this").digest("hex");
+  const timestampById = new Map([
+    ["pi-user-1", "2026-10-06T22:00:00.000Z"],
+    ["pi-user-2", "2026-10-06T22:01:00.000Z"],
+  ]);
+  const transcriptLine = (id: string) => JSON.stringify({
+    type: "message",
+    id,
+    message: repeated,
+  });
+  const sidecarLines = [...timestampById].map(([piMessageId, createdAt]) => JSON.stringify({
+    type: "timestamp_fallback",
+    role: "user",
+    piMessageId,
+    contentHash: hash,
+    createdAt,
+  }));
+  const hydrate = async (messageIds: string[]) => {
+    await writeFile(sessionFile, [
+      JSON.stringify({ type: "session", id: "repeated", cwd: "/fake/project" }),
+      ...messageIds.map(transcriptLine),
+      "",
+    ].join("\n"));
+    await writeFile(`${sessionFile}.pi-vot.jsonl`, `${sidecarLines.join("\n")}\n`);
+    return hydratePiSession({
+      id: sessionFile,
+      cwd: "/fake/project",
+      name: null,
+      preview: "Repeat this",
+      updatedAt: new Date().toISOString(),
+    });
+  };
+
+  try {
+    const original = await hydrate(["pi-user-1", "pi-user-2", "pi-user-3"]);
+    assert.deepEqual(original.transcript.map((item) => item.type === "user" ? item.createdAt : undefined), [
+      "2026-10-06T22:00:00.000Z",
+      "2026-10-06T22:01:00.000Z",
+      undefined,
+    ]);
+
+    const earlierDeleted = await hydrate(["pi-user-2", "pi-user-3"]);
+    assert.deepEqual(earlierDeleted.transcript.map((item) =>
+      item.type === "user" ? item.createdAt : undefined,
+    ), ["2026-10-06T22:01:00.000Z", undefined]);
+
+    const inserted = await hydrate(["pi-user-new", "pi-user-1", "pi-user-2"]);
+    assert.deepEqual(inserted.transcript.map((item) =>
+      item.type === "user" ? item.createdAt : undefined,
+    ), [undefined, "2026-10-06T22:00:00.000Z", "2026-10-06T22:01:00.000Z"]);
+
+    const restructured = await hydrate(["pi-user-2", "pi-user-1", "pi-user-3"]);
+    assert.deepEqual(restructured.transcript.map((item) =>
+      item.type === "user" ? item.createdAt : undefined,
+    ), ["2026-10-06T22:01:00.000Z", "2026-10-06T22:00:00.000Z", undefined]);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("timestamp fallbacks without persisted Pi IDs fail closed after transcript changes", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-vot-no-pi-message-id-"));
+  const sessionFile = join(root, "no-ids.jsonl");
+  const repeated = { role: "user", content: "Repeat this" };
+  const hash = createHash("sha256").update("user\0Repeat this").digest("hex");
+  await writeFile(`${sessionFile}.pi-vot.jsonl`, `${JSON.stringify({
+    type: "timestamp_fallback",
+    localId: "local-message-id",
+    role: "user",
+    contentHash: hash,
+    occurrence: 0,
+    createdAt: "2026-10-06T22:00:00.000Z",
+  })}\n`);
+
+  try {
+    for (const transcript of [
+      [repeated],
+      [{ role: "user", content: "Inserted before" }, repeated],
+      [{ role: "user", content: "Reordered context" }, repeated],
+    ]) {
+      await writeFile(sessionFile, [
+        JSON.stringify({ type: "session", id: "no-ids", cwd: "/fake/project" }),
+        ...transcript.map((message) => JSON.stringify({ type: "message", message })),
+        "",
+      ].join("\n"));
+      const hydrated = await hydratePiSession({
+        id: sessionFile,
+        cwd: "/fake/project",
+        name: null,
+        preview: "Repeat this",
+        updatedAt: new Date().toISOString(),
+      });
+      const matchingMessages = hydrated.transcript.filter((item) =>
+        item.type === "user" && item.text === "Repeat this",
+      );
+      assert.ok(matchingMessages.length > 0);
+      assert.ok(matchingMessages.every((item) => item.type === "user" && item.createdAt === undefined));
+    }
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("queued metadata writes remain bound to their original session after switching", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-vot-metadata-session-"));
+  const project = join(root, "project");
+  const sessions = join(root, "sessions");
+  const sessionA = join(sessions, "a.jsonl");
+  const sessionB = join(sessions, "b.jsonl");
+  const discoveryContext = {
+    env: {
+      PI_CODING_AGENT_DIR: join(root, "agent"),
+      PI_CODING_AGENT_SESSION_DIR: sessions,
+    },
+    home: join(root, "home"),
+  };
+  await mkdir(sessions, { recursive: true });
+  for (const [file, id] of [[sessionA, "a"], [sessionB, "b"]] as const) {
+    await writeFile(file, `${JSON.stringify({
+      type: "session",
+      version: 3,
+      id,
+      timestamp: "2026-10-01T00:00:00.000Z",
+      cwd: project,
+    })}\n`);
+  }
+  const child = new FakePiProcess();
+  let activeFile = sessionA;
+  child.onCommand = (command) => {
+    if (command.type === "get_state") {
+      child.respond(command, { data: {
+        isStreaming: false,
+        isCompacting: false,
+        sessionFile: activeFile,
+        sessionId: activeFile,
+      } });
+    } else if (command.type === "get_session_stats") {
+      child.respond(command, { data: { contextUsage: null } });
+    } else if (command.type === "get_messages") {
+      child.respond(command, { data: { messages: [] } });
+    } else if (command.type === "switch_session") {
+      activeFile = String(command.sessionPath);
+      child.respond(command, { data: { cancelled: false } });
+    } else {
+      child.respond(command);
+    }
+  };
+  const service = new PiService(
+    project,
+    () => child as unknown as ChildProcessWithoutNullStreams,
+    undefined,
+    discoveryContext,
+  );
+
+  try {
+    await service.initialize();
+    let releaseWrite!: () => void;
+    const internals = service as unknown as {
+      metadataWrite: Promise<void>;
+      persistMetadata: (event: {
+        type: "compaction";
+        id: string;
+        createdAt: string;
+        afterIndex: number;
+      }) => Promise<void>;
+      sessionFile: string | null;
+    };
+    internals.metadataWrite = new Promise<void>((resolve) => { releaseWrite = resolve; });
+    const pendingWrite = internals.persistMetadata({
+      type: "compaction",
+      id: "compaction-session-a",
+      createdAt: "2026-10-06T22:02:00.000Z",
+      afterIndex: -1,
+    });
+
+    const switching = service.switchSession(sessionB);
+    await waitFor(() => internals.sessionFile === sessionB);
+    releaseWrite();
+    await Promise.all([pendingWrite, switching]);
+
+    const metadataA = await readFile(`${sessionA}.pi-vot.jsonl`, "utf8");
+    assert.match(metadataA, /compaction-session-a/);
+    await assert.rejects(readFile(`${sessionB}.pi-vot.jsonl`, "utf8"), { code: "ENOENT" });
+  } finally {
+    await service.stop();
+    await rm(root, { recursive: true, force: true });
+  }
 });
 
 test("failed submission of a queued message is reported and removed without being retried", async () => {
@@ -859,6 +2118,7 @@ test("failed submission of a queued message is reported and removed without bein
   await service.sendMessage("keep me", "failed-queue");
   isCompacting = false;
   child.emitRecord({ type: "compaction_end", reason: "threshold", result: { summary: "done" }, aborted: false });
+  child.emitRecord({ type: "agent_settled" });
   await waitFor(() => events.some((event) => event.type === "queued_message_failed"));
   assert.ok(events.some((event) =>
     event.type === "queued_message_failed" &&
@@ -990,6 +2250,7 @@ test("Pi session discovery, transcript hydration, native new/rename/delete, and 
       id: "history-1",
       type: "assistant",
       text: "The old assistant response.",
+      createdAt: new Date(2).toISOString(),
       thinking: "Inspecting the stored transcript.",
     });
     assert.equal(snapshot.transcript[2]?.type, "tool");
@@ -997,6 +2258,39 @@ test("Pi session discovery, transcript hydration, native new/rename/delete, and 
       assert.equal(snapshot.transcript[2].toolName, "read");
       assert.equal(snapshot.transcript[2].output, "Stored tool output.");
     }
+    const originalHistoryRevision = snapshot.historyRevision;
+    messages = [
+      { ...userMessage, id: "history-0" },
+      {
+        ...assistantMessage,
+        id: "history-1",
+        content: [
+          { type: "thinking", thinking: "Updated thinking." },
+          { type: "text", text: "Updated assistant content." },
+          { type: "toolCall", id: toolCallId, name: "read", arguments: { path: "notes.md" } },
+        ],
+      },
+      { ...toolResult, content: [{ type: "text", text: "Updated tool output." }] },
+    ];
+    await service.refreshPersistedState();
+    snapshot = service.snapshot();
+    assert.notEqual(snapshot.historyRevision, originalHistoryRevision);
+    assert.equal(snapshot.transcript[1]?.type, "assistant");
+    if (snapshot.transcript[1]?.type === "assistant") {
+      assert.equal(snapshot.transcript[1].text, "Updated assistant content.");
+      assert.equal(snapshot.transcript[1].thinking, "Updated thinking.");
+    }
+    assert.equal(snapshot.transcript[2]?.type, "tool");
+    if (snapshot.transcript[2]?.type === "tool")
+      assert.equal(snapshot.transcript[2].output, "Updated tool output.");
+
+    const updatedHistoryRevision = snapshot.historyRevision;
+    messages = [{ role: "user", id: "replacement-branch-user", content: "A different selected branch." }];
+    await service.refreshPersistedState();
+    snapshot = service.snapshot();
+    assert.notEqual(snapshot.historyRevision, updatedHistoryRevision);
+    assert.equal(snapshot.transcript[0]?.id, "replacement-branch-user");
+    assert.equal(snapshot.activeSessionId, namedSession);
 
     await service.switchSession(unnamedSession);
     snapshot = service.snapshot();
@@ -1016,25 +2310,165 @@ test("Pi session discovery, transcript hydration, native new/rename/delete, and 
     assert.equal(service.snapshot().sessions.find((session) => session.id === namedSession)?.name, "Renamed in Pi");
     assert.match(await readFile(namedSession, "utf8"), /"name":"Renamed in Pi"/);
 
+    const metadataSidecar = `${createdSession}.pi-vot.jsonl`;
+    const piVotDebugLog = `${createdSession}.pi-vot-debug.jsonl`;
+    const bigPiDebugLog = `${createdSession}.big-pi-debug.jsonl`;
+    const bigPiSidecar = `${createdSession}.big-pi.json`;
+    const bigPiDirectory = `${createdSession}.big-pi`;
+    await writeFile(metadataSidecar, '{"type":"compaction"}\n');
+    await writeFile(piVotDebugLog, '{"event":"test"}\n');
+    await writeFile(bigPiDebugLog, '{"event":"test"}\n');
+    await writeFile(bigPiSidecar, '{"blocks":[{"tier":1}]}');
+    await mkdir(join(bigPiDirectory, "blocks"), { recursive: true });
+    await writeFile(join(bigPiDirectory, "blocks", "B000001.json"), "{}");
     await service.deleteSession(unnamedSession);
     assert.equal(service.snapshot().sessions.some((session) => session.id === unnamedSession), false);
-    await service.deleteSession(createdSession);
+    await service.sendMessage("stop work before deleting");
+    assert.equal(service.state, "running");
+    let finishShutdown!: () => void;
+    child.shutdownGate = new Promise<void>((resolve) => { finishShutdown = resolve; });
+    const shutdown = service.stop();
+    const deletion = service.deleteSession(createdSession);
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    await stat(createdSession);
+    finishShutdown();
+    await Promise.all([shutdown, deletion]);
     assert.notEqual(service.snapshot().activeSessionId, createdSession);
     assert.equal(service.snapshot().sessions.some((session) => session.id === createdSession), false);
     assert.equal(service.snapshot().sessions.some((session) => session.id === namedSession), true);
+    assert.equal(child.exitCode, 0);
     assert.ok(child.commands.some((command) => command.type === "new_session"));
     assert.ok(child.commands.some((command) => command.type === "switch_session" && command.sessionPath === unnamedSession));
     assert.ok(child.commands.some((command) => command.type === "set_session_name" && command.name === "Renamed in Pi"));
-    assert.equal(child.commands.filter((command) => command.type === "new_session").length, 2);
+    assert.equal(child.commands.filter((command) => command.type === "new_session").length, 1);
     await stat(unnamedSession).then(
       () => assert.fail("The selected session file should have been removed."),
       () => undefined,
     );
+    for (const sidecar of [metadataSidecar, piVotDebugLog, bigPiDebugLog, bigPiSidecar, bigPiDirectory]) {
+      await stat(sidecar).then(
+        () => assert.fail(`Session sidecar ${sidecar} should have been removed.`),
+        () => undefined,
+      );
+    }
     await stat(namedSession);
     await service.stop();
   } finally {
     await service.stop();
     await rm(temporary, { recursive: true, force: true });
+  }
+});
+
+test("session file deletion ignores missing sidecars and reports sidecar filesystem failures", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "pi-vot-delete-session-"));
+  const sessionPath = join(directory, "session.jsonl");
+  const metadataSidecar = `${sessionPath}.pi-vot.jsonl`;
+  try {
+    await writeFile(sessionPath, "transcript");
+    await mkdir(metadataSidecar);
+    await assert.rejects(deletePiSessionFiles(sessionPath), (error: NodeJS.ErrnoException) =>
+      ["EISDIR", "EPERM"].includes(error.code ?? ""));
+    await stat(sessionPath);
+    await stat(metadataSidecar);
+
+    await rm(metadataSidecar, { recursive: true });
+    await deletePiSessionFiles(sessionPath);
+    await assert.rejects(stat(sessionPath), { code: "ENOENT" });
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("session file deletion removes sidecars when the validated transcript is already missing", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "pi-vot-delete-missing-session-"));
+  const sessionPath = join(directory, "session.jsonl");
+  const metadataSidecar = `${sessionPath}.pi-vot.jsonl`;
+  const piVotDebugLog = `${sessionPath}.pi-vot-debug.jsonl`;
+  const bigPiDebugLog = `${sessionPath}.big-pi-debug.jsonl`;
+  const bigPiSidecar = `${sessionPath}.big-pi.json`;
+  try {
+    await writeFile(metadataSidecar, "Pi-vot metadata");
+    await writeFile(piVotDebugLog, "Pi-vot debug");
+    await writeFile(bigPiDebugLog, "Big Pi debug");
+    await writeFile(bigPiSidecar, "Big Pi metadata");
+
+    await deletePiSessionFiles(sessionPath);
+
+    for (const file of [sessionPath, metadataSidecar, piVotDebugLog, bigPiDebugLog, bigPiSidecar]) {
+      await assert.rejects(stat(file), { code: "ENOENT" });
+    }
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("session deletion removes the Big Pi folder without following links or touching neighboring files", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "pi-vot-delete-big-pi-"));
+  const sessionPath = join(directory, "session.jsonl");
+  const bigPiDirectory = `${sessionPath}.big-pi`;
+  const bigPiAgentsDirectory = `${sessionPath}.big-pi-agents`;
+  const legacySidecar = `${sessionPath}.big-pi.json`;
+  const neighboringSession = join(directory, "neighbor.jsonl");
+  const unrelatedDirectory = join(directory, "unrelated");
+  const linkedDirectory = join(bigPiDirectory, "linked");
+  try {
+    await writeFile(sessionPath, "transcript");
+    await writeFile(neighboringSession, "keep neighboring session");
+    await mkdir(join(bigPiDirectory, "blocks"), { recursive: true });
+    await writeFile(join(bigPiDirectory, "manifest.json"), "{}");
+    await writeFile(join(bigPiDirectory, "blocks", "B000001.json"), "{}");
+    await writeFile(join(bigPiDirectory, "temporary.tmp"), "temporary");
+    await mkdir(join(bigPiAgentsDirectory, "agent-a", "blocks"), { recursive: true });
+    await writeFile(join(bigPiAgentsDirectory, "agent-a", "manifest.json"), "agent a manifest");
+    await writeFile(join(bigPiAgentsDirectory, "agent-a", "debug.jsonl"), "agent a debug");
+    await mkdir(join(bigPiAgentsDirectory, "agent-b", "blocks"), { recursive: true });
+    await writeFile(join(bigPiAgentsDirectory, "agent-b", "manifest.json"), "agent b manifest");
+    await mkdir(unrelatedDirectory);
+    await writeFile(join(unrelatedDirectory, "keep.txt"), "keep link target");
+    await symlink(unrelatedDirectory, linkedDirectory, process.platform === "win32" ? "junction" : "dir");
+    await writeFile(legacySidecar, "legacy");
+
+    await deletePiSessionFiles(sessionPath);
+
+    for (const target of [sessionPath, bigPiDirectory, bigPiAgentsDirectory, legacySidecar]) {
+      await assert.rejects(lstat(target), { code: "ENOENT" });
+    }
+    assert.equal(await readFile(neighboringSession, "utf8"), "keep neighboring session");
+    assert.equal(await readFile(join(unrelatedDirectory, "keep.txt"), "utf8"), "keep link target");
+    await stat(directory);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("session deletion propagates partial cleanup failures and can be retried", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "pi-vot-delete-partial-"));
+  const sessionPath = join(directory, "session.jsonl");
+  const metadataSidecar = `${sessionPath}.pi-vot.jsonl`;
+  const legacySidecar = `${sessionPath}.big-pi.json`;
+  const bigPiDirectory = `${sessionPath}.big-pi`;
+  try {
+    await writeFile(sessionPath, "transcript");
+    await writeFile(metadataSidecar, "Pi-vot metadata");
+    await mkdir(legacySidecar);
+    await mkdir(bigPiDirectory);
+    await writeFile(join(bigPiDirectory, "manifest.json"), "{}");
+
+    await assert.rejects(deletePiSessionFiles(sessionPath), (error: NodeJS.ErrnoException) =>
+      ["EISDIR", "EPERM"].includes(error.code ?? ""));
+
+    await assert.rejects(lstat(metadataSidecar), { code: "ENOENT" });
+    await stat(sessionPath);
+    await stat(bigPiDirectory);
+    await stat(legacySidecar);
+
+    await rm(legacySidecar, { recursive: true });
+    await deletePiSessionFiles(sessionPath);
+    for (const target of [sessionPath, bigPiDirectory, legacySidecar]) {
+      await assert.rejects(lstat(target), { code: "ENOENT" });
+    }
+  } finally {
+    await rm(directory, { recursive: true, force: true });
   }
 });
 
@@ -1054,6 +2488,17 @@ test("Pi session and project switching is blocked during active, compacting, and
   child.emitRecord({ type: "compaction_start", reason: "manual" });
   await assert.rejects(service.switchSession("/unused"), /Finish or stop/);
   await assert.rejects(service.changeProjectDirectory("/unused"), /Finish or stop/);
+  await service.stop();
+});
+
+test("failed Pi processes report their disconnect instead of an active-operation guard", async () => {
+  const { child, service } = setup();
+  await service.initialize();
+  child.close(17);
+
+  assert.equal(service.state, "failed");
+  await assert.rejects(service.newSession(), /Pi exited with code 17/);
+  await assert.rejects(service.switchSession("/unused"), /Pi exited with code 17/);
   await service.stop();
 });
 

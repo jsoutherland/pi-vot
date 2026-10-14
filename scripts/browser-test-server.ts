@@ -24,14 +24,17 @@ class FakePiService {
   context: PiVotSnapshot["context"] = { tokens: 134_982, contextWindow: 200_000, percent: 67.5 };
   model: PiVotSnapshot["model"] = { provider: "fake-provider", id: "fake-model", name: "fake-model", contextWindow: 200_000, input: ["text", "image"] };
   private queue: Array<{ id: string; message: string; images: ImageAttachment[] }> = [];
+  private followUps: Array<{ id: string; message: string; images: ImageAttachment[] }> = [];
   private messageId = 0;
   private nextCompactionError?: string;
   private nextCompactionDuration?: number;
   private externalSessionCount = 0;
   private projectDirectory = "/fake/project";
   private activeSessionId = "/fake/project/current.jsonl";
+  private selectedSessionId: string | null = this.activeSessionId;
   private activeSessionName: string | null = "Current session";
   private sessions: Array<{ id: string; cwd: string; name: string | null; preview: string; updatedAt: string }> = [];
+  private readonly persistedProjectSessions = new Map<string, typeof this.sessions>();
   private transcripts = new Map<string, TranscriptItem[]>();
   private readonly activeSessions = new Set<string>();
   private readonly runtimeSessions = new Set<string>();
@@ -52,10 +55,15 @@ class FakePiService {
   private resetSessionState(): void {
     this.projectDirectory = "/fake/project";
     this.activeSessionId = "/fake/project/current.jsonl";
+    this.selectedSessionId = this.activeSessionId;
     this.activeSessionName = "Current session";
     this.state = "idle";
     this.isCompacting = false;
     this.queue = [];
+    this.followUps = [];
+    this.messageId = 0;
+    this.nextCompactionError = undefined;
+    this.nextCompactionDuration = undefined;
     this.context = { tokens: 134_982, contextWindow: 200_000, percent: 67.5 };
     this.model = { provider: "fake-provider", id: "fake-model", name: "fake-model", contextWindow: 200_000, input: ["text", "image"] };
     this.externalSessionCount = 0;
@@ -68,6 +76,21 @@ class FakePiService {
       { id: historicalId, cwd: this.projectDirectory, name: "HDF5 debugging", preview: "Investigate persisted sessions", updatedAt },
       { id: unnamedId, cwd: this.projectDirectory, name: null, preview: "Find a parser regression", updatedAt },
     ];
+    this.persistedProjectSessions.clear();
+    for (const [directory, name] of [
+      ["/fake/other-project", "Current session"],
+      ["/fake/project-b", "Current session"],
+      ["/fake/project-c", "Current session"],
+    ]) {
+      const id = `${directory}/current.jsonl`;
+      this.persistedProjectSessions.set(directory, [{
+        id,
+        cwd: directory,
+        name,
+        preview: name,
+        updatedAt,
+      }]);
+    }
     this.activeSessions.clear();
     this.activeSessions.add(this.activeSessionId);
     this.runtimeSessions.clear();
@@ -86,8 +109,8 @@ class FakePiService {
     }
     this.transcripts.clear();
     this.transcripts.set(historicalId, [
-      { id: "history-user-1", type: "user", text: "Investigate persisted sessions", imageCount: 1 },
-      { id: "history-assistant-1", type: "assistant", text: "I will inspect the saved history.", thinking: "Reviewing the selected Pi session." },
+      { id: "history-user-1", type: "user", text: "Investigate persisted sessions", createdAt: "2026-10-06T16:18:00.000Z", imageCount: 1 },
+      { id: "history-assistant-1", type: "assistant", text: "I will inspect the saved history.", createdAt: "2026-10-06T16:19:00.000Z", thinking: "Reviewing the selected Pi session." },
       {
         id: `tool-${toolCallId}`,
         type: "tool",
@@ -109,6 +132,27 @@ class FakePiService {
       { id: "unnamed-assistant", type: "assistant", text: "This session has no stored name." },
     ]);
     this.transcripts.set(this.activeSessionId, []);
+    for (const projectSessions of this.persistedProjectSessions.values()) {
+      for (const session of projectSessions) {
+        this.transcripts.set(session.id, []);
+        this.sessionStates.set(session.id, {
+          state: "idle",
+          isCompacting: false,
+          context: { tokens: 80_000, contextWindow: 200_000, percent: 40 },
+          model: { provider: "fake-provider", id: "fake-model", name: "fake-model", contextWindow: 200_000, input: ["text", "image"] },
+          queue: [],
+        });
+      }
+    }
+  }
+
+  resetForBrowserTest(): void {
+    if (this.timer) clearTimeout(this.timer);
+    this.timer = undefined;
+    for (const timer of this.backgroundTimers.values()) clearInterval(timer);
+    this.backgroundTimers.clear();
+    this.resetSessionState();
+    this.emitSnapshot();
   }
 
   subscribe(listener: (event: PiVotEvent) => void): () => void {
@@ -126,23 +170,89 @@ class FakePiService {
       if (right.cwd === this.projectDirectory && left.cwd !== this.projectDirectory) return 1;
       return right.updatedAt.localeCompare(left.updatedAt);
     });
+    const transcript = (this.selectedSessionId ? this.transcripts.get(this.selectedSessionId) ?? [] : []);
+    const transcriptStart = Math.max(0, transcript.length - 100);
+    const currentTranscriptPage = transcript.slice(transcriptStart).map((item) => ({ ...item }));
     return {
       state: this.state as PiVotSnapshot["state"],
       isCompacting: this.isCompacting,
       context: { ...this.context },
       model: this.model ? { ...this.model } : null,
-      queuedMessages: this.queue.map(({ id, message, images }) => ({
+      queuedMessages: [...this.queue, ...this.followUps].map(({ id, message, images }) => ({
         id,
         message,
         ...(images.length ? { imageCount: images.length } : {}),
       })),
       projectDirectory: this.projectDirectory,
-      activeSessionId: this.activeSessionId,
-      selectedSessionId: this.activeSessionId,
-      activeSessionName: this.activeSessionName,
+      activeSessionId: this.selectedSessionId,
+      selectedSessionId: this.selectedSessionId,
+      historyRevision: "browser-fixture",
+      activeSessionName: this.selectedSessionId ? this.activeSessionName : null,
       sessions,
-      transcript: (this.transcripts.get(this.activeSessionId) ?? []).map((item) => ({ ...item })),
-      status: this.sessionStates.get(this.activeSessionId)?.status ?? null,
+      transcript: currentTranscriptPage,
+      transcriptHasOlder: transcriptStart > 0,
+      ...(transcriptStart > 0 ? { transcriptBeforeId: currentTranscriptPage[0]?.id } : {}),
+      bigPi: this.selectedSessionId === `${this.projectDirectory}/current.jsonl`
+        ? {
+            storagePresent: true,
+            diskUsageBytes: 0,
+            manifestStatus: "valid",
+            totalChunks: 0,
+            tiers: { t1: 0, t2: 0, t3: 0 },
+          }
+        : this.selectedSessionId === `${this.projectDirectory}/history-hydration.jsonl`
+        ? {
+            storagePresent: true,
+            diskUsageBytes: 1536,
+            manifestStatus: "valid",
+            totalChunks: 10,
+            tiers: { t1: 7, t2: 2, t3: 1 },
+          }
+        : this.selectedSessionId === `${this.projectDirectory}/unnamed.jsonl`
+          ? {
+              storagePresent: true,
+              diskUsageBytes: 512,
+              manifestStatus: "valid",
+              totalChunks: 4,
+              tiers: { t1: 2, t2: 1, t3: 1 },
+            }
+        : null,
+      billionContextPi: this.selectedSessionId === `${this.projectDirectory}/current.jsonl`
+        ? {
+            detected: true,
+            sidecarPresent: true,
+            manifestStatus: "valid",
+            totalBlocks: 0,
+            tiers: { t1: 0, t2: 0, t3: 0 },
+          }
+        : this.selectedSessionId === `${this.projectDirectory}/history-hydration.jsonl`
+        ? {
+            detected: true,
+            sidecarPresent: true,
+            manifestStatus: "valid",
+            totalBlocks: 6,
+            tiers: { t1: 3, t2: 2, t3: 1 },
+          }
+        : null,
+      status: this.selectedSessionId
+        ? this.sessionStates.get(this.selectedSessionId)?.status ?? null
+        : null,
+    };
+  }
+
+  async getOlderTranscriptPage(sessionId: string, beforeId: string, revision: string) {
+    if (sessionId !== this.selectedSessionId) throw new Error("The selected session changed.");
+    const transcript = this.transcripts.get(sessionId) ?? [];
+    const cursor = transcript.findIndex((item) => item.id === beforeId);
+    if (cursor < 0) throw new Error("The history cursor is no longer valid.");
+    const start = Math.max(0, cursor - 100);
+    const items = transcript.slice(start, cursor).map((item) => ({ ...item }));
+    return {
+      sessionId,
+      historyRevision: revision,
+      items,
+      hasOlder: start > 0,
+      ...(start > 0 ? { beforeId: items[0]?.id } : {}),
     };
   }
 
@@ -172,6 +282,7 @@ class FakePiService {
     if (!this.sessions.some((session) => session.id === sessionId)) throw new Error("That Pi session is no longer available.");
     if (this.runtimeSessions.has(this.activeSessionId)) this.saveCurrentRuntimeState();
     this.activeSessionId = sessionId;
+    this.selectedSessionId = sessionId;
     this.activeSessionName = this.sessions.find((session) => session.id === sessionId)?.name ?? null;
     this.loadRuntimeState(sessionId);
     if (!this.runtimeSessions.has(sessionId)) {
@@ -192,16 +303,28 @@ class FakePiService {
     this.runtimeSessions.add(sessionId);
     this.activeSessions.add(sessionId);
     this.activeSessionId = sessionId;
+    this.selectedSessionId = sessionId;
     this.activeSessionName = this.sessions.find((session) => session.id === sessionId)?.name ?? null;
     this.loadRuntimeState(sessionId);
     this.emitSnapshot();
   }
 
   async newSession(): Promise<void> {
-    this.assertSessionSwitchSafe();
-    this.activeSessions.delete(this.activeSessionId);
-    this.runtimeSessions.delete(this.activeSessionId);
+    const projectHasBusyRuntime = this.sessions.some((session) => {
+      if (session.cwd !== this.projectDirectory || !this.runtimeSessions.has(session.id)) return false;
+      const state = this.sessionStates.get(session.id);
+      return state?.state === "running" || state?.state === "stopping" || state?.isCompacting === true ||
+        (state?.queue.length ?? 0) > 0;
+    });
+    if (projectHasBusyRuntime) {
+      if (this.runtimeSessions.has(this.activeSessionId)) this.saveCurrentRuntimeState();
+    } else {
+      this.assertSessionSwitchSafe();
+      this.activeSessions.delete(this.activeSessionId);
+      this.runtimeSessions.delete(this.activeSessionId);
+    }
     this.activeSessionId = `${this.projectDirectory}/new-${++this.messageId}.jsonl`;
+    this.selectedSessionId = this.activeSessionId;
     this.activeSessions.add(this.activeSessionId);
     this.runtimeSessions.add(this.activeSessionId);
     this.activeSessionName = null;
@@ -213,6 +336,9 @@ class FakePiService {
       model: { provider: "fake-provider", id: "fake-model", name: "fake-model", contextWindow: 200_000, input: ["text", "image"] },
       queue: [],
     });
+    this.state = "idle";
+    this.isCompacting = false;
+    this.queue = [];
     this.sessions.unshift({
       id: this.activeSessionId,
       cwd: this.projectDirectory,
@@ -234,36 +360,117 @@ class FakePiService {
   }
 
   async deleteSession(sessionId: string): Promise<void> {
-    this.assertSessionSwitchSafe();
-    if (this.runtimeSessions.has(sessionId)) throw new Error("Close this session's runtime before deleting its persisted session.");
     if (!this.sessions.some((session) => session.id === sessionId)) throw new Error("That Pi session is no longer available.");
-    if (sessionId === this.activeSessionId) await this.newSession();
+    this.runtimeSessions.delete(sessionId);
+    this.activeSessions.delete(sessionId);
+    const timer = this.backgroundTimers.get(sessionId);
+    if (timer) clearTimeout(timer);
+    this.backgroundTimers.delete(sessionId);
     this.sessions = this.sessions.filter((session) => session.id !== sessionId);
     this.transcripts.delete(sessionId);
+    this.sessionStates.delete(sessionId);
+    if (sessionId === this.activeSessionId) {
+      this.activeSessionId = "";
+      this.activeSessionName = null;
+      this.state = "idle";
+      this.isCompacting = false;
+      this.context = { tokens: null, contextWindow: null, percent: null };
+      this.model = null;
+    }
     this.emitSnapshot();
   }
 
   async changeProjectDirectory(directory: string): Promise<void> {
     this.projectDirectory = directory;
-    const projectSessionId = `${directory}/current.jsonl`;
-    if (!this.sessions.some((session) => session.id === projectSessionId)) {
-      this.sessions.push({
-        id: projectSessionId,
+    this.selectedSessionId = null;
+    this.activeSessionName = null;
+    const knownSessions = this.persistedProjectSessions.get(directory) ?? [];
+    this.sessions = [
+      ...this.sessions,
+      ...knownSessions.filter(({ id }) => !this.sessions.some((session) => session.id === id)),
+    ];
+    this.state = "idle";
+    this.isCompacting = false;
+    this.context = { tokens: null, contextWindow: null, percent: null };
+    this.model = null;
+    this.queue = [];
+    this.emitSnapshot();
+  }
+
+  async sendNewSessionMessage(
+    message: string,
+    messageId: string,
+    sessionId: string | undefined,
+    images: ImageAttachment[],
+    mode: "send" | "queue" | "steer" | undefined,
+    directory: string,
+  ): Promise<{ disposition: string; sessionId: string }> {
+    const selectOnCompletion = this.projectDirectory === directory && this.selectedSessionId === null;
+    let target = sessionId;
+    if (!target) {
+      if (this.runtimeSessions.size >= 4)
+        throw new Error("Four Pi sessions are already active. Stop or release one before starting another.");
+      target = `${directory}/deferred-${++this.messageId}.jsonl`;
+      const created = {
+        id: target,
         cwd: directory,
-        name: "Current session",
-        preview: "Current session",
+        name: null,
+        preview: message.slice(0, 80) || "New session",
         updatedAt: new Date().toISOString(),
-      });
-      this.sessionStates.set(projectSessionId, {
+      };
+      this.sessions.unshift(created);
+      this.transcripts.set(target, []);
+      this.sessionStates.set(target, {
         state: "idle",
         isCompacting: false,
         context: { tokens: null, contextWindow: null, percent: null },
-        model: { provider: "fake-provider", id: "fake-model", name: "fake-model", contextWindow: 200_000, input: ["text", "image"] },
+        model: { ...fakeModels[0]! },
         queue: [],
       });
-      this.transcripts.set(projectSessionId, []);
     }
-    this.emitSnapshot();
+    else if (!this.sessions.some((session) => session.id === target)) {
+      throw new Error("That Pi session is no longer available.");
+    }
+    if (!this.runtimeSessions.has(target) && this.runtimeSessions.size >= 4)
+      throw new Error("Four Pi sessions are already active. Stop or release one before starting another.");
+    this.activeSessionId = target;
+    if (selectOnCompletion) this.projectDirectory = directory;
+    this.runtimeSessions.add(target);
+    this.activeSessions.add(target);
+    this.activeSessionName = this.sessions.find((session) => session.id === target)?.name ?? null;
+    this.loadRuntimeState(target);
+    try {
+      const disposition = await this.sendMessage(message, messageId, undefined, images, mode);
+      if (disposition === "started") {
+        await new Promise((resolve) => setTimeout(resolve, 650));
+        const transcript = this.transcripts.get(target) ?? [];
+        const createdAt = new Date().toISOString();
+        transcript.push({
+          id: messageId,
+          type: "user",
+          text: message,
+          ...(images.length ? { imageCount: images.length } : {}),
+          createdAt,
+        });
+        transcript.push({
+          id: `deferred-assistant-${randomUUID()}`,
+          type: "assistant",
+          text: "Canonical final answer.",
+          createdAt,
+        });
+        this.transcripts.set(target, transcript);
+      }
+      if (selectOnCompletion) {
+        this.selectedSessionId = target;
+        this.emitSnapshot();
+      }
+      return { disposition, sessionId: target };
+    }
+    catch (error) {
+      this.selectedSessionId = null;
+      if (error instanceof Error) Object.assign(error, { sessionId: target });
+      throw error;
+    }
   }
 
   private assertSessionSwitchSafe(): void {
@@ -277,6 +484,7 @@ class FakePiService {
     queueId: string = randomUUID(),
     targetSessionId?: string,
     images: ImageAttachment[] = [],
+    mode?: "send" | "queue" | "steer",
   ): Promise<string> {
     if (targetSessionId && targetSessionId !== this.activeSessionId) {
       if (!this.activeSessions.has(targetSessionId) && this.activeSessions.size >= 4) {
@@ -296,8 +504,29 @@ class FakePiService {
       this.loadRuntimeState(targetSessionId);
       this.emitSnapshot();
     }
+    if (mode) {
+      if (this.isCompacting) throw new Error("Pi is compacting; wait for compaction to finish before sending.");
+      if (mode === "send" && this.state !== "idle") {
+        throw new Error("Pi is already responding; choose Queue or Steer.");
+      }
+      if ((mode === "queue" || mode === "steer") && this.state !== "running") {
+        throw new Error("Pi is not running; choose Send after it becomes idle.");
+      }
+    }
     if (message === "background stream") return this.sendBackgroundMessage(this.activeSessionId, message, queueId);
     if (message === "background crash") return this.sendBackgroundCrash(this.activeSessionId, queueId);
+    if (message === "show one MCP warning") {
+      this.emit({
+        type: "notice",
+        message: "MCP: Failed to connect to eclipse_coder: fetch failed — Nothing is listening at http://localhost:8124/mcp/eclipse-coder. Start the app or local process that serves this MCP server.",
+      });
+      return "handled";
+    }
+    if (message === "show MCP warnings") {
+      this.emit({ type: "notice", message: "MCP: Failed to connect to eclipse_coder: fetch failed." });
+      this.emit({ type: "notice", message: "MCP: The local browser tools server is unavailable." });
+      return "handled";
+    }
     if (message === "arm no-op compaction") {
       this.nextCompactionError = "Nothing to compact (session too small)";
       return "handled";
@@ -306,8 +535,38 @@ class FakePiService {
       this.nextCompactionDuration = 2_000;
       return "handled";
     }
+    if (message === "arm navigation compaction") {
+      this.nextCompactionDuration = 6_000;
+      return "handled";
+    }
+    if (message === "tool-only activity") {
+      this.emit({ type: "thinking_delta", messageId: "tool-only", text: "Still thinking." });
+      this.emit({ type: "tool_start", toolCallId: "tool-only-call", toolName: "read", input: "{}" });
+      this.emit({ type: "tool_update", toolCallId: "tool-only-call", output: "Updated." });
+      this.emit({ type: "tool_end", toolCallId: "tool-only-call", toolName: "read", output: "Done.", isError: false });
+      this.emit({ type: "context_update", context: { tokens: 42_000, contextWindow: 200_000, percent: 21 } });
+      this.emit({ type: "model_update", model: this.model });
+      this.setState("running");
+      this.setState("idle");
+      return "handled";
+    }
+    if (message === "assistant delta only") {
+      this.emit({ type: "assistant_delta", messageId: "orphan-delta", text: "Transport update only." });
+      return "handled";
+    }
+    if (message === "assistant-only response") {
+      const id = `fake-${++this.messageId}`;
+      const createdAt = new Date().toISOString();
+      this.emit({ type: "assistant_start", messageId: id, createdAt });
+      this.emit({ type: "assistant_end", messageId: id, text: "Assistant follow-up.", thinking: "", createdAt });
+      return "handled";
+    }
     if (message === "show unavailable context") {
       this.emit({ type: "context_update", context: { tokens: null, contextWindow: null, percent: null } });
+      return "handled";
+    }
+    if (message === "show small context") {
+      this.emit({ type: "context_update", context: { tokens: 19_999, contextWindow: 200_000, percent: 10 } });
       return "handled";
     }
     if (message === "show incomplete context") {
@@ -322,18 +581,69 @@ class FakePiService {
     if (message === "fail queued image" && !this.isCompacting)
       throw new Error("Fake Pi rejected the queued image.");
     if (this.isCompacting) {
+      if (mode) throw new Error("Pi is compacting; wait for compaction to finish before sending.");
       this.queue.push({ id: queueId, message, images });
       this.emit({ type: "queued_message", id: queueId, message, ...(images.length ? { imageCount: images.length } : {}) });
       return "queued";
     }
     if (this.state === "running") {
+      if (mode === "queue") {
+        this.followUps.push({ id: queueId, message, images });
+        this.emit({ type: "input_disposition", disposition: "queued" });
+        return "queued";
+      }
+      this.emit({ type: "user_message", messageId: queueId, createdAt: new Date().toISOString() });
       this.emit({ type: "input_disposition", disposition: "steered" });
       return "steered";
     }
 
+    const userCreatedAt = new Date().toISOString();
+    this.emit({ type: "user_message", messageId: queueId, createdAt: userCreatedAt });
+    if (message === "accepted user delayed assistant") {
+      this.setState("running");
+      setTimeout(() => {
+        const assistantId = `fake-${++this.messageId}`;
+        const createdAt = new Date().toISOString();
+        this.emit({ type: "assistant_start", messageId: assistantId, createdAt });
+        this.emit({ type: "assistant_end", messageId: assistantId, text: "Delayed assistant.", thinking: "", createdAt });
+        this.setState("idle");
+      }, 500);
+      return "started";
+    }
     if (message === "trigger automatic compaction") {
       this.setState("running");
       this.beginCompaction("threshold");
+      return "started";
+    }
+    if (message === "trigger compaction with streamed agent output") {
+      this.setState("running");
+      this.beginCompaction("threshold", true, undefined, 1_500);
+      const messageId = `fake-compaction-agent-${++this.messageId}`;
+      const createdAt = new Date().toISOString();
+      setTimeout(() => {
+        this.emit({ type: "assistant_start", messageId, createdAt });
+        this.emit({ type: "thinking_delta", messageId, text: "Thinking during compaction." });
+        this.emit({ type: "assistant_delta", messageId, text: "Response during compaction." });
+        this.emit({ type: "tool_start", toolCallId: `${messageId}-tool`, toolName: "read", input: '{"path":"src/example.ts"}' });
+        this.emit({ type: "tool_update", toolCallId: `${messageId}-tool`, output: "Tool output during compaction." });
+        this.emit({ type: "tool_end", toolCallId: `${messageId}-tool`, toolName: "read", output: "Tool completed during compaction.", isError: false });
+        this.emit({ type: "assistant_end", messageId, text: "Response during compaction.", thinking: "Thinking during compaction.", createdAt });
+      }, 150);
+      return "started";
+    }
+    if (message === "recover stale compaction") {
+      this.setState("running");
+      this.isCompacting = true;
+      const runtimeState = this.sessionStates.get(this.activeSessionId);
+      if (runtimeState) runtimeState.isCompacting = true;
+      this.emit({ type: "compaction_start", reason: "threshold" });
+      this.timer = setTimeout(() => {
+        this.isCompacting = false;
+        if (runtimeState) runtimeState.isCompacting = false;
+        this.setState("idle");
+        this.emit({ type: "compaction_end", success: false, aborted: false });
+        void this.deliverQueued();
+      }, 250);
       return "started";
     }
     if (message === "trigger failed compaction") {
@@ -343,8 +653,43 @@ class FakePiService {
     }
 
     const id = `fake-${++this.messageId}`;
+    const assistantCreatedAt = new Date().toISOString();
     this.setState("running");
-    this.emit({ type: "assistant_start", messageId: id });
+    this.emit({ type: "assistant_start", messageId: id, createdAt: assistantCreatedAt });
+    if (message === "thinking preview" || message === "thinking session switch") {
+      const sessionId = this.activeSessionId;
+      const longLine = `Long thinking line ${"overflow ".repeat(32)}`;
+      const thinking = `First line\n\n${longLine}\n\nCurrent unfinished line`;
+      this.emitFor(sessionId, { type: "thinking_delta", messageId: id, text: "First line\n\n" });
+      this.timer = setTimeout(() => {
+        this.emitFor(sessionId, { type: "thinking_delta", messageId: id, text: longLine });
+      }, 800);
+      this.timer = setTimeout(() => {
+        this.emitFor(sessionId, { type: "thinking_delta", messageId: id, text: "\n\nCurrent unfinished line" });
+      }, 2_800);
+      this.timer = setTimeout(() => {
+        const transcript = this.transcripts.get(sessionId) ?? [];
+        transcript.push({
+          id,
+          type: "assistant",
+          text: "Thinking preview complete.",
+          thinking,
+          createdAt: assistantCreatedAt,
+        });
+        this.transcripts.set(sessionId, transcript);
+        this.emitFor(sessionId, {
+          type: "assistant_end",
+          messageId: id,
+          text: "Thinking preview complete.",
+          thinking,
+        });
+        const state = this.sessionStates.get(sessionId);
+        if (state) state.state = "idle";
+        if (this.activeSessionId === sessionId) this.setState("idle");
+        else this.emitFor(sessionId, { type: "state", state: "idle" });
+      }, 4_300);
+      return "started";
+    }
     if (message === "markdown response") {
       this.emit({ type: "assistant_delta", messageId: id, text: "**" });
       this.emit({ type: "assistant_delta", messageId: id, text: "\n\n```python\ndef f(" });
@@ -399,6 +744,16 @@ class FakePiService {
           this.setState("idle");
         }, 100);
       }, 100);
+      return "started";
+    }
+    if (message === "rapid deltas") {
+      const text = Array.from({ length: 1_000 }, (_, index) => `token-${index}|`).join("");
+      for (let index = 0; index < 1_000; index++) {
+        this.emit({ type: "thinking_delta", messageId: id, text: `think-${index}|` });
+        this.emit({ type: "assistant_delta", messageId: id, text: `token-${index}|` });
+      }
+      this.emit({ type: "assistant_end", messageId: id, text, thinking: "Canonical thinking." });
+      this.setState("idle");
       return "started";
     }
     if (message === "markdown security") {
@@ -493,6 +848,26 @@ class FakePiService {
     if (!wasRunning) this.resetSessionState();
   }
 
+  async cancelQueuedMessage(messageId: string, sessionId?: string): Promise<boolean> {
+    if (sessionId && sessionId !== this.activeSessionId) return false;
+    const queuedIndex = this.queue.findIndex((message) => message.id === messageId);
+    const followUpIndex = this.followUps.findIndex((message) => message.id === messageId);
+    if (queuedIndex < 0 && followUpIndex < 0) return false;
+    if (queuedIndex >= 0) this.queue.splice(queuedIndex, 1);
+    if (followUpIndex >= 0) this.followUps.splice(followUpIndex, 1);
+    this.emit({ type: "queued_message_cancelled", id: messageId });
+    return true;
+  }
+
+  async clearQueuedMessages(sessionId?: string): Promise<string[]> {
+    if (sessionId && sessionId !== this.activeSessionId) return [];
+    const ids = [...this.queue, ...this.followUps].map((message) => message.id);
+    this.queue = [];
+    this.followUps = [];
+    for (const id of ids) this.emit({ type: "queued_message_cancelled", id });
+    return ids;
+  }
+
   async compact(): Promise<void> {
     if (this.isCompacting) throw new Error("Pi is already compacting.");
     const error = this.nextCompactionError;
@@ -523,6 +898,25 @@ class FakePiService {
       models: fakeModels.map((model) => ({ ...model })),
       canChange,
       ...(!canChange ? { message: "Model can be changed when the session is idle." } : {}),
+    };
+  }
+
+  async getPromptTemplates(sessionId: string) {
+    if (!this.runtimeSessions.has(sessionId)) {
+      return {
+        sessionId,
+        hasRuntime: false,
+        commands: [],
+        message: "Activate this session before loading its prompt templates.",
+      };
+    }
+    return {
+      sessionId,
+      hasRuntime: true,
+      commands: [
+        { name: "review", description: "Review the requested changes." },
+        { name: "summarize", description: "Summarize the selected work." },
+      ],
     };
   }
 
@@ -562,10 +956,15 @@ class FakePiService {
         this.context = { tokens: 31_000, contextWindow: 200_000, percent: 15.5 };
         this.emit({ type: "context_update", context: { ...this.context } });
       }
+      const entry = success
+        ? { id: `compaction-${randomUUID()}`, type: "compaction" as const, createdAt: new Date().toISOString() }
+        : undefined;
+      if (entry) this.transcripts.get(this.activeSessionId)?.push(entry);
       this.emit({
         type: "compaction_end",
         success,
         aborted: false,
+        ...(entry ? { entry } : {}),
         ...(!success ? { error: error ?? "Fake compaction failed safely." } : {}),
         ...(error === "Nothing to compact (session too small)" ? { informational: true } : {}),
       });
@@ -597,10 +996,19 @@ class FakePiService {
     const runtimeState = this.sessionStates.get(this.activeSessionId);
     if (runtimeState) runtimeState.state = state;
     this.emit({ type: "state", state: state as "idle" | "running" });
+    if (state === "idle" && this.followUps.length > 0) {
+      queueMicrotask(() => {
+        if (this.state !== "idle" || this.isCompacting) return;
+        const queued = this.followUps.shift();
+        if (!queued) return;
+        this.emit({ type: "user_message", messageId: queued.id, createdAt: new Date().toISOString() });
+      });
+    }
   }
 
   private emitSnapshot(): void {
-    this.emit({ type: "session_snapshot", snapshot: this.snapshot() });
+    const event = { type: "session_snapshot" as const, snapshot: this.snapshot() };
+    for (const listener of this.listeners) listener(event);
   }
 
   private emit(event: PiVotEvent): void {
@@ -608,9 +1016,9 @@ class FakePiService {
   }
 
   private emitFor(sessionId: string, event: PiVotEvent): void {
-    if (event.type === "error") {
+    if (event.type === "notice" || event.type === "error") {
       const state = this.sessionStates.get(sessionId);
-      if (state) state.status = { kind: "error", message: event.message };
+      if (state) state.status = { kind: event.type, message: event.message };
     }
     for (const listener of this.listeners) listener({ ...event, sessionId });
   }
@@ -747,7 +1155,8 @@ class FakePiService {
   }
 }
 
-const app = createPaneServer(new FakePiService());
+const fakePiService = new FakePiService();
+const app = createPaneServer(fakePiService);
 app.server.listen(4174, "127.0.0.1");
 
 async function close(): Promise<void> {

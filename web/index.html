@@ -12,12 +12,13 @@
       <header id="app-header">
         <h1>Pi-vot</h1>
         <div id="project-controls">
-          <span>Project</span>
-          <code id="project-directory">Loading…</code>
-          <label class="visually-hidden" for="project-path">Project directory path</label>
-          <input id="project-path" type="text" autocomplete="off" spellcheck="false" placeholder="Project directory path" />
-          <button id="pick-project" type="button">Choose…</button>
-          <button id="select-project" type="button">Open</button>
+          <div id="project-picker">
+            <button id="project-trigger" type="button" aria-label="Project directory" aria-haspopup="menu" aria-expanded="false" aria-controls="project-menu" title="Project directory">
+              <span id="project-directory">Loading…</span>
+              <span id="project-directory-disclosure" aria-hidden="true">▾</span>
+            </button>
+            <div id="project-menu" role="menu" aria-label="Project directories" hidden></div>
+          </div>
         </div>
       </header>
       <div id="workspace">
@@ -29,24 +30,47 @@
           <ul id="session-list"></ul>
         </aside>
         <section id="conversation-pane">
-          <section id="conversation" aria-live="off" aria-label="Conversation"></section>
-          <p id="status" data-state="idle" role="status"></p>
-          <section id="context-panel" aria-label="Session context and model">
-            <div id="model-info">
-              <span class="visually-hidden">Model:</span>
-              <button id="model-trigger" type="button" aria-label="Current model: Loading…" aria-haspopup="listbox" aria-expanded="false" aria-controls="model-picker">
-                <span id="model-name">Loading…</span>
-                <span aria-hidden="true">▾</span>
-              </button>
-              <section id="model-picker" aria-label="Select model" hidden>
-                <p id="model-picker-status" role="status" aria-live="polite"></p>
-                <ul id="model-options" role="listbox" aria-label="Available models"></ul>
-                <p id="model-picker-message"></p>
-                <button id="model-picker-refresh" type="button">Refresh models</button>
-              </section>
+          <p id="history-loading" aria-hidden="true" hidden>Loading earlier messages…</p>
+          <div id="conversation-area">
+            <section id="conversation" aria-live="off" aria-label="Conversation" tabindex="0"></section>
+            <section id="queued-message-area" aria-label="Queued messages" hidden>
+              <div class="queued-message-divider">
+                <button id="queued-messages-toggle" type="button" aria-expanded="false" aria-controls="queued-messages">Queued Messages (0)</button>
+                <button id="queued-messages-clear" type="button" aria-label="Cancel all queued messages" title="Cancel all queued messages">×</button>
+              </div>
+              <div id="queued-messages" aria-live="polite" hidden></div>
+            </section>
+            <p id="status" data-state="idle" role="status" hidden></p>
+            <div id="session-history-loading" aria-live="off" hidden>
+              <span class="session-history-spinner" aria-hidden="true"></span>
+              <span id="session-history-loading-count" aria-live="off">Loaded 0 messages…</span>
             </div>
+            <p id="session-history-loading-announcement" class="visually-hidden" aria-live="polite"></p>
+          </div>
+          <section id="context-panel" aria-label="Session context">
             <div class="context-heading">
-              <span>Context</span>
+              <span id="context-label" class="context-label">
+                <span>Context</span>
+                <span id="big-pi-anchor" class="big-pi-anchor">
+                  <button id="big-pi-indicator" type="button" aria-label="Big Pi storage statistics" aria-describedby="big-pi-details" hidden>
+                    <svg aria-hidden="true" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="1.6">
+                      <path d="M12 8.5v3M5.5 11.5h13M5.5 11.5v3M18.5 11.5v3" />
+                      <rect x="9.25" y="2.5" width="5.5" height="6" rx=".8" />
+                      <rect x="2.5" y="14.5" width="6" height="7" rx=".8" />
+                      <rect x="15.5" y="14.5" width="6" height="7" rx=".8" />
+                      <text id="big-pi-top-label" x="12" y="7" text-anchor="middle" font-size="5.5" font-weight="700" fill="currentColor" stroke="none"></text>
+                    </svg>
+                  </button>
+                  <span id="big-pi-details" class="big-pi-tooltip" role="tooltip">
+                    <strong id="big-pi-title">Big Pi Storage</strong>
+                    <span id="big-pi-disk"></span>
+                    <span id="big-pi-t1"></span>
+                    <span id="big-pi-t2"></span>
+                    <span id="big-pi-t3"></span>
+                    <span id="big-pi-total"></span>
+                  </span>
+                </span>
+              </span>
               <span id="context-value">Loading…</span>
               <span id="context-percent">Unavailable</span>
               <button id="compact" type="button">Compact</button>
@@ -56,17 +80,75 @@
           </section>
           <div id="composer-splitter" role="separator" aria-label="Resize message composer" aria-orientation="horizontal" aria-valuemin="96" aria-valuemax="55" aria-valuenow="24" tabindex="0"></div>
           <form id="message-form">
-            <div id="attachment-area">
-              <p id="attachment-warning" role="status" hidden></p>
-              <div id="attachment-strip" aria-label="Pending image attachments"></div>
-              <button id="attach-images" type="button" aria-label="Attach images" title="Attach images">+</button>
+            <div id="composer-toolbar">
+              <div id="composer-toolbar-controls">
+                <button id="attach-images" type="button" aria-label="Attach images" title="Attach images">+</button>
+                <div id="model-info">
+                  <span class="visually-hidden">Model:</span>
+                  <button id="model-trigger" type="button" aria-label="Current model: Loading…" aria-haspopup="listbox" aria-expanded="false" aria-controls="model-picker">
+                    <span id="model-name">Loading…</span>
+                    <span aria-hidden="true">▾</span>
+                  </button>
+                  <section id="model-picker" aria-label="Select model" hidden>
+                    <p id="model-picker-status" role="status" aria-live="polite"></p>
+                    <ul id="model-options" role="listbox" aria-label="Available models"></ul>
+                    <p id="model-picker-message"></p>
+                    <button id="model-picker-refresh" type="button">Refresh models</button>
+                  </section>
+                </div>
+                <button id="message-preview-toggle" type="button" aria-pressed="false" aria-controls="message-preview">Preview</button>
+                <div id="toolbar-utility-controls">
+                  <span id="help-anchor">
+                    <button id="help-button" type="button" aria-label="Help" aria-haspopup="dialog" aria-controls="help-dialog" aria-describedby="help-tooltip">
+                      <svg aria-hidden="true" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="1.7">
+                        <path d="M5 3.5h10.5L19 7v13.5H5z" />
+                        <path d="M15.5 3.5V7H19M8 11h8M8 14h8M8 17h5" />
+                      </svg>
+                    </button>
+                    <span id="help-tooltip" role="tooltip">Help</span>
+                  </span>
+                  <div id="warning-anchor">
+                    <button id="warning-indicator" type="button" aria-label="Warnings" aria-expanded="false" aria-controls="warning-details" aria-describedby="warning-details" hidden>
+                      <svg aria-hidden="true" viewBox="0 0 24 24">
+                        <path d="M12 2.7 1.8 20.4c-.5.9.1 1.9 1.1 1.9h18.2c1 0 1.6-1.1 1.1-1.9L12 2.7Z" fill="currentColor" />
+                        <path d="M12 8v6.3m0 3.5v.1" fill="none" stroke="#282018" stroke-linecap="round" stroke-width="2.2" />
+                      </svg>
+                      <span id="warning-count" aria-hidden="true"></span>
+                    </button>
+                    <div id="warning-details" role="dialog" aria-label="Warnings" hidden>
+                      <button id="warning-dismiss" type="button" aria-label="Dismiss warnings">×</button>
+                      <div id="warning-messages"></div>
+                    </div>
+                  </div>
+                </div>
+              </div>
+              <div id="attachment-area">
+                <p id="attachment-warning" role="status" hidden></p>
+                <div id="attachment-strip" aria-label="Pending image attachments"></div>
+              </div>
             </div>
+            <div id="prompt-template-suggestions" hidden></div>
             <div id="drop-overlay" role="status" hidden>Drop images here</div>
             <label class="visually-hidden" for="message">Message Pi</label>
-            <textarea id="message" name="message" placeholder="Message Pi..." rows="2"></textarea>
+            <div id="message-markdown-overlay" aria-hidden="true"></div>
+            <textarea id="message" name="message" placeholder="Message Pi..." rows="2" aria-controls="prompt-template-suggestion-list" aria-autocomplete="list" aria-expanded="false"></textarea>
+            <div id="message-preview" class="message-preview markdown-content" aria-label="Formatted message preview" hidden></div>
             <div id="composer-actions">
               <button id="wake" type="button" hidden>Wake</button>
-              <button id="send" type="submit">Send</button>
+              <div id="send-mode-control">
+                <button id="send" type="submit">Send</button>
+                <details id="busy-mode-picker">
+                  <summary aria-label="Choose busy message action" title="Choose busy message action">▾</summary>
+                  <div id="busy-mode-options" role="group" aria-label="Busy message action">
+                    <button type="button" data-mode="steer">
+                      <strong>Steer</strong><span>Deliver at the next steering boundary.</span>
+                    </button>
+                    <button type="button" data-mode="queue">
+                      <strong>Queue</strong><span>Run after the current request finishes.</span>
+                    </button>
+                  </div>
+                </details>
+              </div>
               <button id="stop" type="button" hidden>Stop</button>
             </div>
             <input id="image-picker" type="file" accept="image/*" multiple hidden />
@@ -74,6 +156,16 @@
         </section>
       </div>
     </main>
+    <dialog id="help-dialog" aria-labelledby="help-title">
+      <div class="help-dialog-layout">
+        <header class="help-dialog-header">
+          <h2 id="help-title">Pi-vot Help</h2>
+          <button id="help-close" type="button" aria-label="Close help">×</button>
+        </header>
+        <article id="help-content" class="help-content markdown-content" aria-live="polite"></article>
+        <p id="help-error" role="status" hidden>Help could not be loaded.</p>
+      </div>
+    </dialog>
     <script src="/vendor/highlight.min.js"></script>
     <script src="/vendor/marked.umd.js"></script>
     <script type="module" src="/main.js"></script>

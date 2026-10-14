@@ -1,13 +1,23 @@
 import assert from "node:assert/strict";
-import { mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
+import {
+  bigPiDirectoryPath,
+  bigPiLegacySidecarPath,
+  readBigPiSummary,
+  type BigPiSummary,
+} from "../src/big-pi.ts";
+import { billionContextPiSidecarPath } from "../src/billion-context-pi.ts";
 import type { PiDiscoveryContext } from "../src/pi-service.ts";
 import {
   PiRuntimeRegistry,
+  HISTORY_PAGE_SIZE,
   MAX_ACTIVE_RUNTIMES,
+  hydrateStablePiSession,
 } from "../src/runtime-registry.ts";
+import { deletePiSessionFiles } from "../src/pi-service.ts";
 import type {
   PiVotEvent,
   PiVotSnapshot,
@@ -16,35 +26,54 @@ import type {
 import type { ImageAttachment } from "../src/request.ts";
 
 class FakeRuntime {
+  private static nextSessionId = 0;
   private listeners = new Set<(event: PiVotEvent) => void>();
   private state: PiVotSnapshot["state"] = "idle";
   private compacting = false;
   private context: PiVotSnapshot["context"] = { tokens: null, contextWindow: null, percent: null };
   private model: PiVotSnapshot["model"] = null;
   private transcript: PiVotSnapshot["transcript"] = [];
+  private readonly historyRevision = "fake-runtime-history";
   private queuedMessages: PiVotSnapshot["queuedMessages"] = [];
   private sessions: PiSession[] = [];
   private readonly cwd: string;
   private readonly knownSessions: Map<string, PiSession[]>;
+  private readonly initialSessionId?: string;
   activeSessionId: string | null = null;
   stopped = false;
   failInitialize = false;
   abortCount = 0;
+  refreshCount = 0;
+  refreshWork?: () => Promise<void>;
   sentMessages: string[] = [];
   newSessionCount = 0;
   renamedSessions: Array<{ id: string; name: string }> = [];
   deletedSessions: string[] = [];
   sentImages: ImageAttachment[][] = [];
+  waitBeforeSend?: () => Promise<void>;
+  startRunningBeforeNewSessionError = false;
 
-  constructor(cwd: string, knownSessions: Map<string, PiSession[]>) {
+  constructor(cwd: string, knownSessions: Map<string, PiSession[]>, initialSessionId?: string) {
     this.cwd = cwd;
     this.knownSessions = knownSessions;
+    this.initialSessionId = initialSessionId;
   }
 
   async initialize(): Promise<void> {
     if (this.failInitialize) throw new Error("Fake Pi failed to initialize.");
     this.sessions = this.knownSessions.get(this.cwd) ?? [];
-    this.activeSessionId = this.sessions[0]?.id ?? `${this.cwd}/generated.jsonl`;
+    if (this.initialSessionId) {
+      this.activeSessionId = `${this.cwd}/fresh-${this.initialSessionId}.jsonl`;
+      this.sessions.unshift({
+        id: this.activeSessionId,
+        cwd: this.cwd,
+        name: null,
+        preview: "New session",
+        updatedAt: new Date().toISOString(),
+      });
+    } else {
+      this.activeSessionId = this.sessions[0]?.id ?? `${this.cwd}/generated.jsonl`;
+    }
     this.model = { provider: "fake", id: "fake-model", name: "fake-model", contextWindow: 10_000 };
     this.context = { tokens: 100, contextWindow: 10_000, percent: 1 };
     this.transcript = [];
@@ -67,16 +96,32 @@ class FakeRuntime {
       activeSessionName: this.sessions.find(({ id }) => id === this.activeSessionId)?.name ?? null,
       sessions: this.sessions.map((item) => ({ ...item })),
       transcript: this.transcript.map((item) => ({ ...item })),
+      historyRevision: this.historyRevision,
     };
   }
 
-  async refreshPersistedState(): Promise<void> {}
+  setTranscript(items: PiVotSnapshot["transcript"]): void {
+    this.transcript = items.map((item) => ({ ...item }));
+  }
+
+  get canChangeModel(): boolean {
+    return this.state === "idle" && !this.compacting && this.queuedMessages.length === 0;
+  }
+
+  async refreshPersistedState(): Promise<void> {
+    this.refreshCount++;
+    await this.refreshWork?.();
+  }
 
   async getAvailableModels() {
     return [
       { provider: "fake", id: "fake-model", name: "fake-model", contextWindow: 10_000 },
       { provider: "fake", id: "changed-model", name: "changed-model", contextWindow: 20_000 },
     ];
+  }
+
+  async getPromptTemplates() {
+    return [{ name: "review", description: "Review changes" }];
   }
 
   async changeModel(provider: string, modelId: string): Promise<void> {
@@ -99,6 +144,8 @@ class FakeRuntime {
     messageId = "fake-message",
     images: ImageAttachment[] = [],
   ): Promise<"started" | "steered" | "queued"> {
+    await this.waitBeforeSend?.();
+    if (message === "fail new session") throw new Error("Fake Pi rejected the prompt.");
     this.sentMessages.push(message);
     this.sentImages.push(images);
     if (this.compacting) {
@@ -125,7 +172,13 @@ class FakeRuntime {
 
   async newSession(): Promise<void> {
     this.newSessionCount++;
-    this.activeSessionId = `${this.cwd}/new-session.jsonl`;
+    if (this.startRunningBeforeNewSessionError) {
+      this.startRunningBeforeNewSessionError = false;
+      this.state = "running";
+      this.emit({ type: "state", state: "running" });
+      throw new Error("Finish or stop the active Pi operation before switching sessions or projects.");
+    }
+    this.activeSessionId = `${this.cwd}/new-session-${++FakeRuntime.nextSessionId}.jsonl`;
     this.sessions.unshift({
       id: this.activeSessionId,
       cwd: this.cwd,
@@ -144,6 +197,8 @@ class FakeRuntime {
 
   async deleteSession(sessionId: string): Promise<void> {
     this.deletedSessions.push(sessionId);
+    await this.stop();
+    await deletePiSessionFiles(sessionId);
   }
 
   async stop(): Promise<void> {
@@ -160,7 +215,20 @@ class FakeRuntime {
   }
 }
 
-async function createFixture(sessionCount = 5): Promise<{
+async function waitFor(predicate: () => boolean, timeoutMs = 1_000): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (!predicate()) {
+    if (Date.now() >= deadline) throw new Error("Timed out waiting for the runtime refresh.");
+    await new Promise((resolve) => setTimeout(resolve, 2));
+  }
+}
+
+async function createFixture(
+  sessionCount = 5,
+  historyCacheByteLimit?: number,
+  historyLoader?: typeof hydrateStablePiSession,
+  bigPiReader?: typeof readBigPiSummary,
+): Promise<{
   root: string;
   cwd: string;
   sessions: PiSession[];
@@ -170,6 +238,7 @@ async function createFixture(sessionCount = 5): Promise<{
   configuredSessions: Map<string, PiSession[]>;
   discoveryContext: PiDiscoveryContext;
   failNextInitialization: () => void;
+  setSendWaiter: (waiter: (() => Promise<void>) | undefined) => void;
 }> {
   const root = await mkdtemp(join(tmpdir(), "pi-vot-registry-"));
   const cwd = join(root, "project");
@@ -200,13 +269,15 @@ async function createFixture(sessionCount = 5): Promise<{
   const configuredSessions = new Map([[cwd, sessions]]);
   const services: FakeRuntime[] = [];
   let failNextInitialization = false;
-  const registry = new PiRuntimeRegistry(cwd, (directory) => {
-    const service = new FakeRuntime(directory, configuredSessions);
+  let sendWaiter: (() => Promise<void>) | undefined;
+  const registry = new PiRuntimeRegistry(cwd, (directory, initialSessionId) => {
+    const service = new FakeRuntime(directory, configuredSessions, initialSessionId);
     service.failInitialize = failNextInitialization;
+    service.waitBeforeSend = () => sendWaiter?.() ?? Promise.resolve();
     failNextInitialization = false;
     services.push(service);
     return service as never;
-  }, discoveryContext);
+  }, discoveryContext, historyCacheByteLimit, historyLoader, bigPiReader);
   return {
     root,
     cwd,
@@ -217,6 +288,7 @@ async function createFixture(sessionCount = 5): Promise<{
     configuredSessions,
     discoveryContext,
     failNextInitialization: () => { failNextInitialization = true; },
+    setSendWaiter: (waiter) => { sendWaiter = waiter; },
   };
 }
 
@@ -254,6 +326,430 @@ async function addProjectSessions(
   return sessions;
 }
 
+function waitForSnapshot(
+  registry: PiRuntimeRegistry,
+  predicate: (snapshot: PiVotSnapshot) => boolean,
+): Promise<PiVotSnapshot> {
+  const current = registry.snapshot();
+  if (predicate(current)) return Promise.resolve(current);
+  return new Promise((resolve) => {
+    const unsubscribe = registry.subscribe((event) => {
+      if (event.type !== "session_snapshot" || !predicate(event.snapshot)) return;
+      unsubscribe();
+      resolve(event.snapshot);
+    });
+  });
+}
+
+test("inactive history pages are chronological, stable, bounded, and do not activate Pi", async () => {
+  const fixture = await createFixture(2);
+  const records: unknown[] = [];
+  let parentId: string | null = null;
+  for (let index = 0; index < 250; index++) {
+    const id = `history-${index}`;
+    records.push({
+      type: "message",
+      id,
+      parentId,
+      timestamp: new Date(Date.UTC(2026, 9, 1, 0, index)).toISOString(),
+      message: {
+        role: "user",
+        content: index === 149 || index === 249 ? "x".repeat(1_200_000) : `Message ${index}`,
+      },
+    });
+    parentId = id;
+  }
+  await writeFile(fixture.sessions[0]!.id, [
+    JSON.stringify({ type: "session", id: "large-history", cwd: fixture.cwd }),
+    ...records.map((record) => JSON.stringify(record)),
+    "",
+  ].join("\n"));
+  await writeFile(`${fixture.sessions[0]!.id}.pi-vot.jsonl`, `${JSON.stringify({
+    type: "compaction",
+    id: "history-compaction",
+    createdAt: "2026-10-02T00:00:00.000Z",
+    afterId: "history-149",
+    afterIndex: 149,
+  })}\n`);
+  try {
+    await fixture.registry.initialize();
+    const initial = fixture.registry.snapshot();
+    assert.equal(initial.transcript.length, 1);
+    assert.equal(initial.transcript[0]?.id, "history-249");
+    assert.ok(Buffer.byteLength(JSON.stringify(initial.transcript)) > 1_048_576);
+    assert.equal(initial.transcriptHasOlder, true);
+    assert.equal(fixture.services.length, 0);
+
+    const allIds = initial.transcript.map((item) => item.id);
+    const sessionId = fixture.sessions[0]!.id;
+    let cursor = initial.transcriptBeforeId;
+    while (cursor) {
+      const page = await fixture.registry.getOlderTranscriptPage(sessionId, cursor, initial.historyRevision!);
+      assert.ok(page.items.length > 0);
+      assert.ok(page.items.length <= HISTORY_PAGE_SIZE);
+      if (page.items.some((item) => item.id === "history-149")) assert.equal(page.items.length, 1);
+      allIds.unshift(...page.items.map((item) => item.id));
+      cursor = page.beforeId;
+      assert.equal(page.hasOlder, Boolean(cursor));
+    }
+
+    assert.equal(allIds.length, 251);
+    assert.equal(new Set(allIds).size, allIds.length);
+    assert.equal(allIds[0], "history-0");
+    assert.equal(allIds.at(-1), "history-249");
+    assert.ok(allIds.indexOf("history-compaction") > allIds.indexOf("history-149"));
+    assert.deepEqual(
+      allIds.filter((id) => id.startsWith("history-") && id !== "history-compaction"),
+      Array.from({ length: 250 }, (_, index) => `history-${index}`),
+    );
+    assert.equal(fixture.services.length, 0);
+    await assert.rejects(
+      fixture.registry.getOlderTranscriptPage(sessionId, "missing-cursor", initial.historyRevision!),
+      /cursor is no longer valid/,
+    );
+  } finally {
+    await fixture.registry.stop();
+    await rm(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test("New Session uses the folder of the selected inactive session", async () => {
+  const fixture = await createFixture(2);
+  try {
+    await fixture.registry.initialize();
+    const projectB = join(fixture.root, "project-b");
+    const [sessionB] = await addProjectSessions(fixture, projectB);
+    await fixture.registry.refreshPersistedState();
+    await fixture.registry.switchSession(sessionB!.id);
+
+    await fixture.registry.newSession();
+
+    const snapshot = fixture.registry.snapshot();
+    assert.equal(snapshot.sessions.find(({ id }) => id === snapshot.selectedSessionId)?.cwd, projectB);
+    const projectRuntime = fixture.services.find((service) => service.snapshot().projectDirectory === projectB);
+    assert.ok(projectRuntime);
+    assert.equal(projectRuntime.newSessionCount, 0);
+  } finally {
+    await fixture.registry.stop();
+    await rm(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test("cache eviction preserves the authoritative revision and accepts the saved cursor", async () => {
+  const fixture = await createFixture(9);
+  const transcript = Array.from({ length: 105 }, (_, index) => ({
+    type: "message",
+    id: `evicted-${index}`,
+    parentId: index ? `evicted-${index - 1}` : null,
+    message: { role: "user", content: `Evicted message ${index}` },
+  }));
+  for (const session of fixture.sessions) {
+    await writeFile(session.id, [
+      JSON.stringify({ type: "session", id: session.id, cwd: fixture.cwd }),
+      ...transcript.map((record) => JSON.stringify(record)),
+      "",
+    ].join("\n"));
+  }
+  try {
+    await fixture.registry.initialize();
+    let original = fixture.registry.snapshot();
+    const session = fixture.sessions.find(({ id }) => id === original.selectedSessionId)!;
+    assert.equal(original.historyRevision, (await fixture.registry.getOlderTranscriptPage(
+      session.id,
+      original.transcriptBeforeId!,
+      original.historyRevision!,
+    )).historyRevision);
+
+    for (const other of fixture.sessions.filter(({ id }) => id !== session.id)) {
+      await fixture.registry.switchSession(other.id);
+      const snapshot = await waitForSnapshot(fixture.registry, (value) =>
+        value.selectedSessionId === other.id && value.transcript.at(-1)?.id === "evicted-104");
+      await fixture.registry.getOlderTranscriptPage(other.id, snapshot.transcriptBeforeId!, snapshot.historyRevision!);
+    }
+
+    await fixture.registry.switchSession(session.id);
+    original = fixture.registry.snapshot();
+    const page = await fixture.registry.getOlderTranscriptPage(
+      session.id,
+      original.transcriptBeforeId!,
+      original.historyRevision!,
+    );
+    assert.equal(page.historyRevision, original.historyRevision);
+    assert.equal(page.items.at(-1)?.id, "evicted-4");
+    assert.equal(fixture.registry.snapshot().historyRevision, page.historyRevision);
+  } finally {
+    await fixture.registry.stop();
+    await rm(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test("oversized histories page repeatedly without being cacheable and keep one revision", async () => {
+  const fixture = await createFixture(1, 1_048_576);
+  const transcript = Array.from({ length: 350 }, (_, index) => ({
+    type: "message",
+    id: `oversized-${index}`,
+    parentId: index ? `oversized-${index - 1}` : null,
+    message: { role: "user", content: `${index}: ${"x".repeat(4_000)}` },
+  }));
+  await writeFile(fixture.sessions[0]!.id, [
+    JSON.stringify({ type: "session", id: "oversized", cwd: fixture.cwd }),
+    ...transcript.map((record) => JSON.stringify(record)),
+    "",
+  ].join("\n"));
+  try {
+    await fixture.registry.initialize();
+    const sessionId = fixture.sessions[0]!.id;
+    const initial = fixture.registry.snapshot();
+    let cursor = initial.transcriptBeforeId!;
+    let loaded = 0;
+    for (let pageIndex = 0; pageIndex < 4 && cursor; pageIndex++) {
+      const page = await fixture.registry.getOlderTranscriptPage(sessionId, cursor, initial.historyRevision!);
+      assert.equal(page.historyRevision, initial.historyRevision);
+      assert.ok(page.items.length > 0);
+      loaded += page.items.length;
+      cursor = page.beforeId ?? "";
+    }
+    assert.equal(loaded + initial.transcript.length, 350);
+    assert.equal(cursor, "");
+    assert.equal(fixture.registry.snapshot().historyRevision, initial.historyRevision);
+  } finally {
+    await fixture.registry.stop();
+    await rm(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test("history pages preserve the last valid snapshot on read failure and recover without changing its revision", async () => {
+  const fixture = await createFixture(1);
+  const records = Array.from({ length: 105 }, (_, index) => JSON.stringify({
+    type: "message",
+    id: `stable-${index}`,
+    parentId: index ? `stable-${index - 1}` : null,
+    message: { role: "user", content: `Stable message ${index}` },
+  }));
+  const session = fixture.sessions[0]!;
+  const content = `${JSON.stringify({ type: "session", id: "stable", cwd: fixture.cwd })}\n${records.join("\n")}\n`;
+  await writeFile(session.id, content);
+  try {
+    await fixture.registry.initialize();
+    const previous = fixture.registry.snapshot();
+    await rm(session.id);
+    await assert.rejects(
+      fixture.registry.getOlderTranscriptPage(session.id, previous.transcriptBeforeId!, previous.historyRevision!),
+      /last available conversation is unchanged/,
+    );
+    const failed = fixture.registry.snapshot();
+    assert.deepEqual(failed.transcript, previous.transcript);
+    assert.equal(failed.historyRevision, previous.historyRevision);
+    assert.equal(failed.status?.kind, "error");
+
+    await writeFile(session.id, content);
+    const page = await fixture.registry.getOlderTranscriptPage(
+      session.id,
+      previous.transcriptBeforeId!,
+      previous.historyRevision!,
+    );
+    assert.equal(page.historyRevision, previous.historyRevision);
+    assert.equal(page.items.at(-1)?.id, "stable-4");
+    assert.equal(fixture.registry.snapshot().status, null);
+  } finally {
+    await fixture.registry.stop();
+    await rm(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test("continued transcript mutation exhausts retries without erasing valid displayed history", async () => {
+  let simulateMutation = false;
+  let fingerprintCalls = 0;
+  const fixture = await createFixture(1, undefined, (session) =>
+    hydrateStablePiSession(
+      session,
+      undefined,
+      async (sessionId) => simulateMutation
+        ? `changing-${fingerprintCalls++}`
+        : `${sessionId}-${(await stat(sessionId)).size}`,
+    ));
+  const session = fixture.sessions[0]!;
+  const records = Array.from({ length: 105 }, (_, index) => JSON.stringify({
+    type: "message",
+    id: `stable-${index}`,
+    parentId: index ? `stable-${index - 1}` : null,
+    message: { role: "user", content: `Stable message ${index}` },
+  }));
+  const original = `${JSON.stringify({ type: "session", id: "stable", cwd: fixture.cwd })}\n${records.join("\n")}\n`;
+  await writeFile(session.id, original);
+  try {
+    await fixture.registry.initialize();
+    const previous = fixture.registry.snapshot();
+    await writeFile(session.id, `${original}{"type":"message","id":"external-change"}\n`);
+    simulateMutation = true;
+
+    await assert.rejects(
+      fixture.registry.getOlderTranscriptPage(
+        session.id,
+        previous.transcriptBeforeId!,
+        previous.historyRevision!,
+      ),
+      /last available conversation is unchanged/,
+    );
+    assert.equal(fingerprintCalls, 6);
+    assert.deepEqual(fixture.registry.snapshot().transcript, previous.transcript);
+    assert.equal(fixture.registry.snapshot().historyRevision, previous.historyRevision);
+    assert.equal(fixture.registry.snapshot().status?.kind, "error");
+
+    simulateMutation = false;
+    await writeFile(session.id, original);
+    const page = await fixture.registry.getOlderTranscriptPage(
+      session.id,
+      previous.transcriptBeforeId!,
+      previous.historyRevision!,
+    );
+    assert.equal(page.historyRevision, previous.historyRevision);
+    assert.equal(page.items.at(-1)?.id, "stable-4");
+  } finally {
+    await fixture.registry.stop();
+    await rm(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test("stable hydration retries from a fresh fingerprint and bounds repeated transcript changes", async () => {
+  const session = {
+    id: "/fake/session.jsonl",
+    cwd: "/fake",
+    name: "Session",
+    preview: "Session",
+    updatedAt: new Date().toISOString(),
+  };
+  const hydrated = { session, transcript: [], model: null };
+  let fingerprintCalls = 0;
+  let readCalls = 0;
+  const fingerprints = ["before-1", "after-1", "before-2", "before-2"];
+  const stable = await hydrateStablePiSession(
+    session,
+    async () => { readCalls++; return hydrated; },
+    async () => fingerprints[fingerprintCalls++]!,
+  );
+  assert.equal(readCalls, 2);
+  assert.equal(stable.fingerprint, "before-2");
+
+  fingerprintCalls = 0;
+  readCalls = 0;
+  await assert.rejects(
+    hydrateStablePiSession(
+      session,
+      async () => { readCalls++; return hydrated; },
+      async () => `changing-${fingerprintCalls++}`,
+    ),
+    /kept changing/,
+  );
+  assert.equal(readCalls, 3);
+  assert.equal(fingerprintCalls, 6);
+});
+
+test("external branch replacement invalidates cached cursors and same-ID edits refresh the latest page", async () => {
+  const fixture = await createFixture();
+  const session = fixture.sessions[0]!;
+  const createRecords = (prefix: string, revised = false): unknown[] => {
+    const records: unknown[] = [{ type: "session", id: "stable-session", cwd: fixture.cwd }];
+    let parentId: string | null = null;
+    for (let index = 0; index < 250; index++) {
+      const id = `${prefix}-${index}`;
+      records.push({
+        type: "message",
+        id,
+        parentId,
+        message: { role: "user", content: revised && index === 249 ? "Updated existing message ID" : `${prefix} message ${index}` },
+      });
+      parentId = id;
+    }
+    return records;
+  };
+  const writeRecords = (records: unknown[]) => writeFile(session.id, `${records.map((record) => JSON.stringify(record)).join("\n")}\n`);
+  await writeRecords(createRecords("branch-a"));
+  try {
+    await fixture.registry.initialize();
+    const initial = fixture.registry.snapshot();
+    assert.equal(initial.transcript.at(-1)?.id, "branch-a-249");
+    const cursor = initial.transcriptBeforeId!;
+
+    await writeRecords(createRecords("branch-b"));
+    await assert.rejects(
+      fixture.registry.getOlderTranscriptPage(session.id, cursor, initial.historyRevision!),
+      (error: Error & { historyRevision?: string }) =>
+        /history changed/.test(error.message) && error.historyRevision !== initial.historyRevision,
+    );
+    const branchB = fixture.registry.snapshot();
+    assert.notEqual(branchB.historyRevision, initial.historyRevision);
+    assert.equal(branchB.transcript.at(-1)?.id, "branch-b-249");
+    const page = await fixture.registry.getOlderTranscriptPage(
+      session.id,
+      branchB.transcriptBeforeId!,
+      branchB.historyRevision!,
+    );
+    assert.equal(page.items.at(-1)?.id, "branch-b-149");
+    assert.equal(page.historyRevision, branchB.historyRevision);
+
+    await writeRecords(createRecords("branch-b", true));
+    await assert.rejects(
+      fixture.registry.getOlderTranscriptPage(session.id, page.beforeId!, branchB.historyRevision!),
+      (error: Error & { historyRevision?: string }) => error.historyRevision !== branchB.historyRevision,
+    );
+    const revised = fixture.registry.snapshot();
+    assert.notEqual(revised.historyRevision, branchB.historyRevision);
+    const latest = revised.transcript.at(-1);
+    assert.equal(latest?.type, "user");
+    if (latest?.type === "user") assert.equal(latest.text, "Updated existing message ID");
+  } finally {
+    await fixture.registry.stop();
+    await rm(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test("inactive history pages remain consistent after runtime activation and release", async () => {
+  const fixture = await createFixture();
+  const session = fixture.sessions[0]!;
+  const transcript = Array.from({ length: 250 }, (_, index) => ({
+    id: `runtime-history-${index}`,
+    type: "user" as const,
+    text: `Runtime history ${index}`,
+  }));
+  await writeFile(session.id, [
+    JSON.stringify({ type: "session", id: "runtime-history", cwd: fixture.cwd }),
+    ...transcript.map((item, index) => JSON.stringify({
+      type: "message",
+      id: item.id,
+      parentId: index ? transcript[index - 1]!.id : null,
+      message: { role: "user", content: item.text },
+    })),
+    "",
+  ].join("\n"));
+  try {
+    await fixture.registry.initialize();
+    const inactive = fixture.registry.snapshot();
+    await fixture.registry.wakeSession(session.id);
+    fixture.services[0]!.setTranscript(transcript);
+    const active = fixture.registry.snapshot();
+    const runtimePage = await fixture.registry.getOlderTranscriptPage(
+      session.id,
+      active.transcriptBeforeId!,
+      active.historyRevision!,
+    );
+    assert.equal(runtimePage.items.at(-1)?.id, "runtime-history-149");
+    await fixture.registry.releaseRuntime(session.id);
+    const released = fixture.registry.snapshot();
+    assert.equal(released.historyRevision, active.historyRevision);
+    const releasedPage = await fixture.registry.getOlderTranscriptPage(
+      session.id,
+      released.transcriptBeforeId!,
+      released.historyRevision!,
+    );
+    assert.equal(releasedPage.items.at(-1)?.id, "runtime-history-149");
+    assert.notEqual(inactive.historyRevision, released.historyRevision);
+  } finally {
+    await fixture.registry.stop();
+    await rm(fixture.root, { recursive: true, force: true });
+  }
+});
+
 test("selection is read-only; Send, release, and the four-runtime cap are enforced", async () => {
   const fixture = await createFixture();
   try {
@@ -276,9 +772,6 @@ test("selection is read-only; Send, release, and the four-runtime cap are enforc
     }
     assert.equal(fixture.services.length, MAX_ACTIVE_RUNTIMES);
     assert.equal(fixture.registry.snapshot().sessions.filter((session) => session.active).length, MAX_ACTIVE_RUNTIMES);
-    const activeSession = fixture.registry.snapshot().sessions.find(({ active }) => active)!;
-    await assert.rejects(fixture.registry.deleteSession(activeSession.id), /Close this session's runtime/);
-
     const fifth = fixture.sessions.find(({ id }) =>
       !fixture.services.some((service) => service.activeSessionId === id),
     )!;
@@ -288,12 +781,292 @@ test("selection is read-only; Send, release, and the four-runtime cap are enforc
     assert.equal(fixture.services.length, MAX_ACTIVE_RUNTIMES);
     assert.equal(fixture.services.some((service) => service.stopped), false);
 
+    const emptyProject = join(fixture.root, "empty-project");
+    await mkdir(emptyProject, { recursive: true });
+    await fixture.registry.changeProjectDirectory(emptyProject);
+    assert.equal(fixture.registry.snapshot().selectedSessionId, null);
+    await assert.rejects(
+      fixture.registry.sendNewSessionMessage("capacity pending", undefined, undefined, [], "send", emptyProject),
+      /Four Pi sessions are already active/,
+    );
+    assert.equal(fixture.services.length, MAX_ACTIVE_RUNTIMES);
+
     for (const service of fixture.services) await service.abort();
     await fixture.registry.releaseRuntime(fixture.services[0]!.activeSessionId!);
     assert.equal(fixture.services[0]!.stopped, true);
     await fixture.registry.sendMessage("activate fifth", undefined, fifth.id);
     assert.equal(fixture.services.length, MAX_ACTIVE_RUNTIMES + 1);
     assert.equal(fixture.registry.snapshot().sessions.filter((session) => session.active).length, MAX_ACTIVE_RUNTIMES);
+  } finally {
+    await fixture.registry.stop();
+    await rm(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test("choosing a project clears selection and defers one new session until Send", async () => {
+  const fixture = await createFixture();
+  try {
+    await fixture.registry.initialize();
+    const sessionA = fixture.sessions[0]!.id;
+    await fixture.registry.sendMessage("existing A", "existing-a", sessionA);
+    const runtimeA = fixture.services[0]!;
+    const projectB = join(fixture.root, "project-b");
+    await addProjectSessions(fixture, projectB);
+
+    await fixture.registry.changeProjectDirectory(projectB);
+    assert.equal(fixture.registry.snapshot().selectedSessionId, null);
+    assert.equal(fixture.registry.snapshot().transcript.length, 0);
+    assert.equal(fixture.services.length, 1);
+    assert.equal(fixture.registry.snapshot().sessions.some(({ cwd }) => cwd === fixture.cwd), true);
+
+    const image: ImageAttachment = {
+      mimeType: "image/png",
+      name: "pending.png",
+      data: "aW1hZ2U=",
+      size: 5,
+    };
+    const first = await fixture.registry.sendNewSessionMessage(
+      "first in B",
+      "first-b",
+      undefined,
+      [image],
+      "send",
+      projectB,
+    );
+    const runtimeB = fixture.services[1]!;
+    assert.equal(first.sessionId, runtimeB.activeSessionId);
+    assert.equal(runtimeB.newSessionCount, 0);
+    assert.deepEqual(runtimeB.sentMessages, ["first in B"]);
+    assert.deepEqual(runtimeB.sentImages, [[image]]);
+    assert.deepEqual(runtimeA.sentMessages, ["existing A"]);
+
+    await fixture.registry.sendMessage("next in B", "next-b", first.sessionId);
+    assert.deepEqual(runtimeB.sentMessages, ["first in B", "next in B"]);
+    assert.equal(fixture.registry.snapshot().selectedSessionId, first.sessionId);
+
+    await fixture.registry.changeProjectDirectory(projectB);
+    assert.equal(fixture.registry.snapshot().selectedSessionId, null);
+    assert.equal(fixture.services.length, 2);
+
+    const failed = await fixture.registry.sendNewSessionMessage(
+      "fail new session",
+      "failed-b",
+      undefined,
+      [],
+      "send",
+      projectB,
+    ).then(
+      () => null,
+      (error: Error & { sessionId?: string }) => error,
+    );
+    assert.ok(failed);
+    assert.equal(typeof failed.sessionId, "string");
+    const failedSessionId = failed.sessionId!;
+    const startsBeforeRetry = fixture.services.length;
+    const retry = await fixture.registry.sendNewSessionMessage(
+      "retry in B",
+      "retry-b",
+      failedSessionId,
+      [],
+      "send",
+      projectB,
+    );
+    assert.equal(retry.sessionId, failedSessionId);
+    assert.equal(fixture.services.length, startsBeforeRetry);
+    assert.deepEqual(fixture.services.at(-1)!.sentMessages, ["retry in B"]);
+
+    const selectedBeforeInvalid = fixture.registry.snapshot().selectedSessionId;
+    await assert.rejects(fixture.registry.changeProjectDirectory(join(fixture.root, "missing")), /Select an existing project directory/);
+    assert.equal(fixture.registry.snapshot().selectedSessionId, selectedBeforeInvalid);
+  } finally {
+    await fixture.registry.stop();
+    await rm(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test("a pending Send stays bound to its original project when navigation changes", async () => {
+  const fixture = await createFixture();
+  try {
+    await fixture.registry.initialize();
+    const projectB = join(fixture.root, "project-b");
+    const projectC = join(fixture.root, "project-c");
+    await addProjectSessions(fixture, projectB);
+    await mkdir(projectC, { recursive: true });
+    await fixture.registry.changeProjectDirectory(projectB);
+
+    let markEntered!: () => void;
+    let releaseSend!: () => void;
+    const entered = new Promise<void>((resolve) => { markEntered = resolve; });
+    const blocked = new Promise<void>((resolve) => { releaseSend = resolve; });
+    fixture.setSendWaiter(async () => {
+      markEntered();
+      await blocked;
+    });
+    const sending = fixture.registry.sendNewSessionMessage(
+      "bound to B",
+      "bound-b",
+      undefined,
+      [],
+      "send",
+      projectB,
+    );
+    await entered;
+    await fixture.registry.changeProjectDirectory(projectC);
+    releaseSend();
+    const result = await sending;
+
+    assert.equal(fixture.registry.snapshot().projectDirectory, projectC);
+    assert.equal(fixture.registry.snapshot().selectedSessionId, null);
+    assert.equal(fixture.services.at(-1)!.snapshot().projectDirectory, projectB);
+    assert.deepEqual(fixture.services.at(-1)!.sentMessages, ["bound to B"]);
+    assert.equal(fixture.registry.snapshot().sessions.some(({ id }) => id === result.sessionId), true);
+  } finally {
+    await fixture.registry.stop();
+    await rm(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test("deleting an active session disposes its runtime and removes only its three session files", async () => {
+  const fixture = await createFixture(2);
+  try {
+    await fixture.registry.initialize();
+    const session = fixture.sessions[0]!;
+    await fixture.registry.wakeSession(session.id);
+    const unrelated = fixture.sessions.find(({ id }) => id !== session.id)!;
+    const metadata = `${session.id}.pi-vot.jsonl`;
+    const bigPi = bigPiDirectoryPath(session.id);
+    const legacyBigPi = bigPiLegacySidecarPath(session.id);
+    const unrelatedMetadata = `${unrelated.id}.pi-vot.jsonl`;
+    const unrelatedBigPi = bigPiLegacySidecarPath(unrelated.id);
+    await Promise.all([
+      writeFile(metadata, '{"type":"compaction"}\n'),
+      mkdir(bigPi, { recursive: true }),
+      writeFile(legacyBigPi, "legacy Big Pi data"),
+      writeFile(unrelatedMetadata, "keep metadata"),
+      writeFile(unrelatedBigPi, "keep Big Pi data"),
+    ]);
+    await writeFile(join(bigPi, "manifest.json"), "{}");
+    const runtime = fixture.services.at(-1)!;
+
+    await fixture.registry.deleteSession(session.id);
+    await fixture.registry.refreshPersistedState();
+
+    assert.equal(runtime.stopped, true);
+    assert.equal(fixture.registry.snapshot().sessions.some(({ id }) => id === session.id), false);
+    for (const file of [session.id, metadata, bigPi, legacyBigPi]) {
+      await assert.rejects(stat(file), { code: "ENOENT" });
+    }
+    for (const file of [unrelated.id, unrelatedMetadata, unrelatedBigPi]) await stat(file);
+  } finally {
+    await fixture.registry.stop();
+    await rm(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test("live session navigation coalesces pending refreshes, refreshes again after completion, and isolates late results", async () => {
+  const fixture = await createFixture(2);
+  const gates = new Map<string, { promise: Promise<void>; resolve: () => void }>();
+  try {
+    await fixture.registry.initialize();
+    const [sessionA, sessionB] = fixture.sessions;
+    assert.ok(sessionA && sessionB);
+    await fixture.registry.wakeSession(sessionA.id);
+    const runtimeA = fixture.services.at(-1)!;
+    await fixture.registry.wakeSession(sessionB.id);
+    const runtimeB = fixture.services.at(-1)!;
+
+    for (const [session, runtime] of [[sessionA, runtimeA], [sessionB, runtimeB]] as const) {
+      let resolve!: () => void;
+      const promise = new Promise<void>((done) => { resolve = done; });
+      gates.set(session.id, { promise, resolve });
+      runtime.refreshWork = async () => {
+        await promise;
+        if (session.id === sessionA.id) {
+          runtime.emit({ type: "context_update", context: { tokens: 333, contextWindow: 10_000, percent: 3.33 } });
+        }
+      };
+    }
+
+    const navigationA = fixture.registry.switchSession(sessionA.id);
+    assert.equal(fixture.registry.snapshot().selectedSessionId, sessionA.id);
+    assert.equal(fixture.registry.snapshot().state, "idle");
+    assert.equal(await Promise.race([
+      navigationA.then(() => "done"),
+      new Promise<string>((resolve) => setTimeout(() => resolve("blocked"), 100)),
+    ]), "done");
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    assert.equal(runtimeA.refreshCount, 1);
+
+    await fixture.registry.switchSession(sessionB.id);
+    await fixture.registry.switchSession(sessionA.id);
+    await fixture.registry.switchSession(sessionB.id);
+    await fixture.registry.switchSession(sessionA.id);
+    assert.equal(runtimeA.refreshCount, 1);
+    assert.equal(runtimeB.refreshCount, 1);
+    assert.equal(fixture.registry.snapshot().selectedSessionId, sessionA.id);
+
+    await fixture.registry.switchSession(sessionB.id);
+    gates.get(sessionA.id)!.resolve();
+    const registryInternals = fixture.registry as unknown as {
+      runtimeRefreshes: Map<object, Promise<void>>;
+      runtimes: Map<string, { service: FakeRuntime }>;
+    };
+    const runtimeEntry = registryInternals.runtimes.get(sessionA.id)!;
+    await registryInternals.runtimeRefreshes.get(runtimeEntry);
+    assert.equal(registryInternals.runtimeRefreshes.has(runtimeEntry), false);
+    assert.equal(runtimeA.canChangeModel, true);
+    assert.equal(runtimeEntry.service, runtimeA);
+    assert.equal(fixture.registry.snapshot().selectedSessionId, sessionB.id);
+    assert.notEqual(fixture.registry.snapshot().context.tokens, 333);
+
+    await fixture.registry.switchSession(sessionA.id);
+    assert.equal(fixture.registry.snapshot().selectedSessionId, sessionA.id);
+    assert.equal(fixture.registry.snapshot().context.tokens, 333);
+    await waitFor(() => runtimeA.refreshCount === 2);
+    assert.equal(runtimeA.refreshCount, 2);
+    gates.get(sessionB.id)!.resolve();
+    await new Promise<void>((resolve) => setImmediate(resolve));
+  } finally {
+    await fixture.registry.stop();
+    await rm(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test("selecting running, stopping, compacting, or queued runtimes does not refresh Pi", async () => {
+  const fixture = await createFixture(4);
+  try {
+    await fixture.registry.initialize();
+    const [sessionA, sessionB, sessionC, sessionD] = fixture.sessions;
+    assert.ok(sessionA && sessionB && sessionC && sessionD);
+    const runtimeBySession = new Map<string, FakeRuntime>();
+    for (const session of [sessionA, sessionB, sessionC, sessionD]) {
+      await fixture.registry.wakeSession(session.id);
+      runtimeBySession.set(session.id, fixture.services.at(-1)!);
+    }
+
+    const running = runtimeBySession.get(sessionA.id)!;
+    await running.sendMessage("still running");
+    const stopping = runtimeBySession.get(sessionB.id)!;
+    stopping.emit({ type: "state", state: "stopping" });
+    const compacting = runtimeBySession.get(sessionC.id)!;
+    await compacting.compact();
+    const queued = runtimeBySession.get(sessionD.id)!;
+    await queued.compact();
+    assert.equal(await queued.sendMessage("queued work", "queued-id"), "queued");
+    queued.emit({ type: "compaction_end", success: true, aborted: false });
+    assert.equal(queued.snapshot().state, "idle");
+    assert.equal(queued.snapshot().queuedMessages.length, 1);
+
+    for (const session of [sessionA, sessionB, sessionC, sessionD]) {
+      const selection = fixture.registry.switchSession(session.id);
+      assert.equal(fixture.registry.snapshot().selectedSessionId, session.id);
+      assert.equal(await Promise.race([
+        selection.then(() => "done"),
+        new Promise<string>((resolve) => setTimeout(() => resolve("blocked"), 100)),
+      ]), "done");
+    }
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    for (const runtime of runtimeBySession.values()) assert.equal(runtime.refreshCount, 0);
   } finally {
     await fixture.registry.stop();
     await rm(fixture.root, { recursive: true, force: true });
@@ -330,6 +1103,327 @@ test("Wake activates one persisted session without sending or changing its trans
     await fixture.registry.releaseRuntime(target.id);
     assert.equal(fixture.registry.snapshot().sessions.find(({ id }) => id === target.id)?.hasRuntime, false);
     assert.deepEqual(fixture.registry.snapshot().transcript, transcriptBefore);
+  } finally {
+    await fixture.registry.stop();
+    await rm(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test("inactive session Big Pi storage stays isolated across selection without activating Pi", async () => {
+  const fixture = await createFixture(2);
+  try {
+    const [sessionA, sessionB] = fixture.sessions;
+    assert.ok(sessionA && sessionB);
+    const storageA = bigPiDirectoryPath(sessionA.id);
+    const storageB = bigPiDirectoryPath(sessionB.id);
+    const manifestA = JSON.stringify({
+      schemaVersion: 1,
+      producer: "big-pi",
+      session: { sessionPath: sessionA.id },
+      blocks: [{
+        blockId: "B000001",
+        tier: 1,
+        chunkPath: "blocks/B000001.json",
+        sha256: "a".repeat(64),
+        private: "not sent",
+      }],
+    });
+    const temporaryA = "temporary";
+    const malformedManifest = "{ malformed";
+    await Promise.all([mkdir(storageA), mkdir(storageB)]);
+    await writeFile(join(storageA, "manifest.json"), manifestA);
+    await writeFile(join(storageA, "orphan.tmp"), temporaryA);
+    await writeFile(join(storageB, "manifest.json"), malformedManifest);
+
+    await fixture.registry.initialize();
+    await fixture.registry.switchSession(sessionA.id);
+    await waitForSnapshot(fixture.registry, (snapshot) =>
+      snapshot.selectedSessionId === sessionA.id &&
+      snapshot.bigPi?.diskUsageBytes === Buffer.byteLength(manifestA) + Buffer.byteLength(temporaryA));
+    assert.equal(fixture.registry.snapshot().selectedSessionId, sessionA.id);
+    assert.deepEqual(fixture.registry.snapshot().bigPi, {
+      storagePresent: true,
+      diskUsageBytes: Buffer.byteLength(manifestA) + Buffer.byteLength(temporaryA),
+      manifestStatus: "valid",
+      totalChunks: 1,
+      tiers: { t1: 1, t2: 0, t3: 0 },
+    });
+    assert.equal(JSON.stringify(fixture.registry.snapshot()).includes("private"), false);
+    assert.equal(fixture.services.length, 0);
+
+    await fixture.registry.switchSession(sessionB.id);
+    await waitForSnapshot(fixture.registry, (snapshot) =>
+      snapshot.selectedSessionId === sessionB.id && snapshot.bigPi?.manifestStatus === "malformed");
+    assert.equal(fixture.registry.snapshot().bigPi?.manifestStatus, "malformed");
+    assert.equal(fixture.registry.snapshot().bigPi?.diskUsageBytes, Buffer.byteLength(malformedManifest));
+    await new Promise<void>((resolve) => setTimeout(resolve, 0));
+    assert.equal(fixture.registry.snapshot().bigPi?.manifestStatus, "malformed");
+    await fixture.registry.refreshPersistedState();
+    assert.equal(fixture.registry.snapshot().sessions.length, 2);
+    assert.equal(fixture.registry.snapshot().bigPi?.manifestStatus, "malformed");
+    assert.equal(fixture.services.length, 0);
+
+    await fixture.registry.switchSession(sessionA.id);
+    assert.deepEqual(fixture.registry.snapshot().bigPi, {
+      storagePresent: true,
+      diskUsageBytes: Buffer.byteLength(manifestA) + Buffer.byteLength(temporaryA),
+      manifestStatus: "valid",
+      totalChunks: 1,
+      tiers: { t1: 1, t2: 0, t3: 0 },
+    });
+    assert.equal(fixture.services.length, 0);
+  } finally {
+    await fixture.registry.stop();
+    await rm(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test("inactive Billion Context Pi summaries are session-scoped and do not activate Pi", async () => {
+  const fixture = await createFixture(2);
+  try {
+    const [sessionA, sessionB] = fixture.sessions;
+    assert.ok(sessionA && sessionB);
+    const sidecar = billionContextPiSidecarPath(sessionA.id);
+    await writeFile(sidecar, JSON.stringify({
+      schemaVersion: 1,
+      producer: "billion-context-pi@0.8.0",
+      blocks: [
+        { blockId: "b1", tier: 1 },
+        { blockId: "b2", tier: 2 },
+        { blockId: "b3", tier: 3 },
+      ],
+    }));
+    const bigPiDirectory = bigPiDirectoryPath(sessionA.id);
+    await mkdir(bigPiDirectory);
+    await writeFile(join(bigPiDirectory, "manifest.json"), JSON.stringify({
+      schemaVersion: 1,
+      producer: "big-pi",
+      session: { sessionPath: sessionA.id },
+      blocks: [{ blockId: "B000001", tier: 1, chunkPath: "blocks/B000001.json", sha256: "a".repeat(64) }],
+    }));
+    await fixture.registry.initialize();
+    await fixture.registry.switchSession(sessionA.id);
+    const selected = await waitForSnapshot(fixture.registry, (snapshot) =>
+      snapshot.selectedSessionId === sessionA.id && snapshot.billionContextPi?.manifestStatus === "valid");
+    assert.deepEqual(selected.billionContextPi, {
+      detected: true,
+      sidecarPresent: true,
+      manifestStatus: "valid",
+      totalBlocks: 3,
+      tiers: { t1: 1, t2: 1, t3: 1 },
+    });
+    assert.equal(fixture.registry.snapshot().billionContextPi?.detected, true);
+    assert.equal(fixture.registry.snapshot().bigPi?.storagePresent, true);
+    assert.equal(fixture.services.length, 0);
+
+    await fixture.registry.switchSession(sessionB.id);
+    const other = await waitForSnapshot(fixture.registry, (snapshot) =>
+      snapshot.selectedSessionId === sessionB.id && snapshot.billionContextPi?.manifestStatus === "absent");
+    assert.equal(other.billionContextPi?.detected, false);
+    assert.equal(fixture.services.length, 0);
+  } finally {
+    await fixture.registry.stop();
+    await rm(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test("compaction completion refreshes selected-session Big Pi disk usage", async () => {
+  const fixture = await createFixture(1);
+  try {
+    const session = fixture.sessions[0]!;
+    const storage = bigPiDirectoryPath(session.id);
+    await mkdir(storage);
+    const manifest = (blocks: unknown[]) => JSON.stringify({
+      schemaVersion: 1,
+      producer: "big-pi",
+      session: { sessionPath: session.id },
+      blocks,
+    });
+    const firstBlock = {
+      blockId: "B000001",
+      tier: 1,
+      chunkPath: "blocks/B000001.json",
+      sha256: "a".repeat(64),
+    };
+    const firstManifest = manifest([firstBlock]);
+    await writeFile(join(storage, "manifest.json"), firstManifest);
+    await fixture.registry.initialize();
+    const initial = await waitForSnapshot(fixture.registry, (snapshot) =>
+      snapshot.bigPi?.diskUsageBytes === Buffer.byteLength(firstManifest));
+    assert.equal(initial.bigPi?.totalChunks, 1);
+
+    await fixture.registry.wakeSession(session.id);
+    const service = fixture.services[0]!;
+    const updatedManifest = manifest([
+      firstBlock,
+      { ...firstBlock, blockId: "B000002", tier: 2, chunkPath: "blocks/B000002.json" },
+    ]);
+    await writeFile(join(storage, "manifest.json"), updatedManifest);
+    service.emit({ type: "compaction_end", success: true, aborted: false });
+
+    const updatedDiskUsage = Buffer.byteLength(updatedManifest);
+    const refreshed = await waitForSnapshot(fixture.registry, (snapshot) =>
+      snapshot.selectedSessionId === session.id &&
+      snapshot.bigPi?.manifestStatus === "valid" &&
+      snapshot.bigPi.diskUsageBytes === updatedDiskUsage &&
+      snapshot.bigPi.totalChunks === 2);
+    assert.equal(refreshed.bigPi?.diskUsageBytes, updatedDiskUsage);
+    assert.equal(refreshed.bigPi?.totalChunks, 2);
+  } finally {
+    await fixture.registry.stop();
+    await rm(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test("successful Big Pi compression refreshes the stats after its manifest commit", async () => {
+  const fixture = await createFixture(1);
+  try {
+    const session = fixture.sessions[0]!;
+    const storage = bigPiDirectoryPath(session.id);
+    await mkdir(storage);
+    const manifest = (blocks: unknown[]) => JSON.stringify({
+      schemaVersion: 1,
+      producer: "big-pi",
+      session: { sessionPath: session.id },
+      blocks,
+    });
+    await writeFile(join(storage, "manifest.json"), manifest([]));
+    await fixture.registry.initialize();
+    assert.equal(fixture.registry.snapshot().bigPi?.totalChunks, 0);
+
+    await fixture.registry.wakeSession(session.id);
+    await writeFile(join(storage, "manifest.json"), manifest([{
+      blockId: "B000001",
+      tier: 1,
+      chunkPath: "blocks/B000001.json",
+      sha256: "a".repeat(64),
+    }]));
+    fixture.services[0]!.emit({
+      type: "tool_end",
+      toolCallId: "compress-1",
+      toolName: "big_pi_compress",
+      output: "Committed B000001",
+      isError: false,
+    });
+
+    const refreshed = await waitForSnapshot(fixture.registry, (snapshot) => snapshot.bigPi?.totalChunks === 1);
+    assert.equal(refreshed.bigPi?.manifestStatus, "valid");
+  } finally {
+    await fixture.registry.stop();
+    await rm(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test("successful BCP compress refreshes its block stats after the sidecar commit", async () => {
+  const fixture = await createFixture(1);
+  try {
+    const session = fixture.sessions[0]!;
+    const sidecar = billionContextPiSidecarPath(session.id);
+    const manifest = (blocks: unknown[]) => JSON.stringify({
+      producer: "billion-context-pi@1.0.0",
+      schemaVersion: 1,
+      blocks,
+    });
+    await writeFile(sidecar, manifest([]));
+    await fixture.registry.initialize();
+    assert.equal(fixture.registry.snapshot().billionContextPi?.totalBlocks, 0);
+
+    await fixture.registry.wakeSession(session.id);
+    await writeFile(sidecar, manifest([{ blockId: "b1", tier: 1 }]));
+    fixture.services[0]!.emit({
+      type: "tool_end",
+      toolCallId: "compress-1",
+      toolName: "compress",
+      output: "Compressed b1",
+      isError: false,
+    });
+
+    const refreshed = await waitForSnapshot(fixture.registry, (snapshot) =>
+      snapshot.billionContextPi?.totalBlocks === 1);
+    assert.equal(refreshed.billionContextPi?.manifestStatus, "valid");
+    assert.equal(refreshed.billionContextPi?.tiers?.t1, 1);
+  } finally {
+    await fixture.registry.stop();
+    await rm(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test("overlapping Big Pi refreshes coalesce and preserve one trailing scan", async () => {
+  const resolvers: Array<(summary: BigPiSummary) => void> = [];
+  let delayedReads = 0;
+  let delay = false;
+  const reader = async (sessionPath: string): Promise<BigPiSummary> => {
+    if (!delay) return readBigPiSummary(sessionPath);
+    delayedReads++;
+    return new Promise((resolve) => resolvers.push(resolve));
+  };
+  const fixture = await createFixture(1, undefined, undefined, reader);
+  try {
+    await fixture.registry.initialize();
+    const sessionId = fixture.sessions[0]!.id;
+    delay = true;
+    const registry = fixture.registry as unknown as {
+      refreshBigPiSummary(id: string): Promise<void>;
+    };
+    const first = registry.refreshBigPiSummary(sessionId);
+    await waitFor(() => delayedReads === 1);
+    const overlapping = registry.refreshBigPiSummary(sessionId);
+    resolvers[0]!({
+      storagePresent: true,
+      diskUsageBytes: 111,
+      manifestStatus: "valid",
+      totalChunks: 1,
+      tiers: { t1: 1, t2: 0, t3: 0 },
+    });
+    await waitFor(() => delayedReads === 2);
+    resolvers[1]!({
+      storagePresent: true,
+      diskUsageBytes: 222,
+      manifestStatus: "valid",
+      totalChunks: 2,
+      tiers: { t1: 0, t2: 2, t3: 0 },
+    });
+    await Promise.all([first, overlapping]);
+    assert.equal(delayedReads, 2);
+    assert.equal(fixture.registry.snapshot().bigPi?.diskUsageBytes, 222);
+    assert.equal(fixture.registry.snapshot().bigPi?.totalChunks, 2);
+  } finally {
+    await fixture.registry.stop();
+    await rm(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test("session deletion invalidates an in-flight Big Pi scan", async () => {
+  let release!: (summary: BigPiSummary) => void;
+  let delayedReads = 0;
+  let delay = false;
+  const reader = async (sessionPath: string): Promise<BigPiSummary> => {
+    if (!delay) return readBigPiSummary(sessionPath);
+    delayedReads++;
+    return new Promise((resolve) => { release = resolve; });
+  };
+  const fixture = await createFixture(1, undefined, undefined, reader);
+  try {
+    await fixture.registry.initialize();
+    const sessionId = fixture.sessions[0]!.id;
+    delay = true;
+    const registry = fixture.registry as unknown as {
+      refreshBigPiSummary(id: string): Promise<void>;
+      bigPiBySession: Map<string, BigPiSummary | null>;
+    };
+    const refresh = registry.refreshBigPiSummary(sessionId);
+    await waitFor(() => delayedReads === 1);
+    await fixture.registry.deleteSession(sessionId);
+    release({
+      storagePresent: true,
+      diskUsageBytes: 999,
+      manifestStatus: "valid",
+      totalChunks: 9,
+      tiers: { t1: 0, t2: 0, t3: 9 },
+    });
+    await refresh;
+    assert.equal(registry.bigPiBySession.has(sessionId), false);
+    assert.equal(fixture.registry.snapshot().selectedSessionId, null);
   } finally {
     await fixture.registry.stop();
     await rm(fixture.root, { recursive: true, force: true });
@@ -388,6 +1482,38 @@ test("Wake enforces the four-runtime cap and failed startup frees its slot", asy
   }
 });
 
+test("New Session reports a failed startup, leaves no runtime registered, and can retry", async () => {
+  const fixture = await createFixture(2);
+  try {
+    await fixture.registry.initialize();
+    const previouslySelected = fixture.registry.snapshot().selectedSessionId;
+    fixture.failNextInitialization();
+
+    await assert.rejects(
+      fixture.registry.newSession(),
+      (error: unknown) => {
+        assert.match(error instanceof Error ? error.message : String(error), /Fake Pi failed to initialize/);
+        assert.doesNotMatch(error instanceof Error ? error.message : String(error), /Finish or stop the active Pi operation/);
+        return true;
+      },
+    );
+
+    assert.equal(fixture.registry.snapshot().selectedSessionId, previouslySelected);
+    assert.equal(fixture.registry.snapshot().sessions.find(({ id }) => id === previouslySelected)?.hasRuntime, false);
+    assert.equal(fixture.services.at(-1)?.stopped, true);
+
+    await fixture.registry.newSession();
+
+    const selected = fixture.registry.snapshot().selectedSessionId;
+    assert.notEqual(selected, previouslySelected);
+    assert.equal(fixture.registry.snapshot().sessions.find(({ id }) => id === selected)?.hasRuntime, true);
+    assert.equal(fixture.services.at(-1)?.stopped, false);
+  } finally {
+    await fixture.registry.stop();
+    await rm(fixture.root, { recursive: true, force: true });
+  }
+});
+
 test("all project groups remain visible and inactive transcripts hydrate without runtimes", async () => {
   const fixture = await createFixture(2);
   const otherProject = join(fixture.root, "other-project");
@@ -401,6 +1527,9 @@ test("all project groups remain visible and inactive transcripts hydrate without
     assert.equal(snapshot.sessions.filter(({ cwd }) => cwd === otherProject).length, 2);
 
     await fixture.registry.switchSession(otherSessions[0]!.id);
+    await waitForSnapshot(fixture.registry, (current) =>
+      current.selectedSessionId === otherSessions[0]!.id && current.transcript.length > 0,
+    );
     assert.equal(fixture.registry.snapshot().selectedSessionId, otherSessions[0]!.id);
     assert.equal(fixture.registry.snapshot().sessions.find(({ id }) => id === otherSessions[0]!.id)?.hasRuntime, false);
     assert.deepEqual(fixture.registry.snapshot().transcript.map(({ type }) => type), ["user", "assistant"]);
@@ -408,6 +1537,9 @@ test("all project groups remain visible and inactive transcripts hydrate without
     assert.equal(firstMessage?.type, "user");
     if (firstMessage?.type === "user") assert.equal(firstMessage.text, `History from ${otherProject}`);
     await fixture.registry.switchSession(otherSessions[1]!.id);
+    await waitForSnapshot(fixture.registry, (current) =>
+      current.selectedSessionId === otherSessions[1]!.id && current.transcript.length > 0,
+    );
     assert.equal(fixture.services.length, 0);
     await fixture.registry.sendMessage("activate this project history", undefined, otherSessions[1]!.id);
     assert.equal(fixture.services.length, 1);
@@ -460,6 +1592,10 @@ test("model inspection does not activate historical sessions and model state sta
     assert.equal(inactiveModels.hasRuntime, false);
     assert.equal(inactiveModels.canChange, false);
     assert.match(inactiveModels.message ?? "", /Activate this session/);
+    const inactiveTemplates = await fixture.registry.getPromptTemplates(sessionB);
+    assert.equal(inactiveTemplates.hasRuntime, false);
+    assert.deepEqual(inactiveTemplates.commands, []);
+    assert.match(inactiveTemplates.message ?? "", /Activate this session/);
     assert.equal(fixture.services.length, 0);
 
     await fixture.registry.switchSession(sessionB);
@@ -467,6 +1603,9 @@ test("model inspection does not activate historical sessions and model state sta
     assert.equal(fixture.services.length, 0);
     await fixture.registry.sendMessage("activate B", undefined, sessionB);
     await fixture.registry.abort(sessionB);
+    const activeTemplates = await fixture.registry.getPromptTemplates(sessionB);
+    assert.equal(activeTemplates.hasRuntime, true);
+    assert.deepEqual(activeTemplates.commands, [{ name: "review", description: "Review changes" }]);
     const modelB = fixture.registry.snapshot().model;
     await fixture.registry.changeModel(sessionB, "fake", "changed-model");
     assert.equal(fixture.registry.snapshot().model?.id, "changed-model");
@@ -476,6 +1615,30 @@ test("model inspection does not activate historical sessions and model state sta
     assert.equal(fixture.services[0]!.snapshot().model?.id, "changed-model");
     assert.notDeepEqual(fixture.services[0]!.snapshot().model, modelB);
     assert.equal(fixture.services[1]!.snapshot().model?.id, "fake-model");
+  } finally {
+    await fixture.registry.stop();
+    await rm(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test("project model choice is remembered for the next session without changing the prior runtime", async () => {
+  const fixture = await createFixture(1);
+  const otherProject = join(fixture.root, "other-project");
+  await mkdir(otherProject, { recursive: true });
+  try {
+    await fixture.registry.initialize();
+    await fixture.registry.wakeSession(fixture.sessions[0]!.id);
+    const priorRuntime = fixture.services[0]!;
+    await fixture.registry.changeProjectDirectory(otherProject);
+    const options = await fixture.registry.getProjectAvailableModels(otherProject);
+    assert.equal(options.model?.id, "fake-model");
+    assert.equal(options.models.length, 2);
+    await fixture.registry.changeProjectModel(otherProject, "fake", "changed-model");
+    assert.equal(fixture.registry.snapshot().model?.id, "changed-model");
+    assert.equal(priorRuntime.snapshot().model?.id, "fake-model");
+
+    await fixture.registry.sendNewSessionMessage("use project model", "new-message", undefined, [], "send", otherProject);
+    assert.equal(fixture.services.at(-1)?.snapshot().model?.id, "changed-model");
   } finally {
     await fixture.registry.stop();
     await rm(fixture.root, { recursive: true, force: true });
@@ -632,7 +1795,7 @@ test("renaming an inactive session uses a temporary helper instead of borrowing 
   }
 });
 
-test("deleting an inactive session uses a temporary helper instead of borrowing a busy runtime", async () => {
+test("deleting an inactive session leaves a busy runtime untouched", async () => {
   const fixture = await createFixture(2);
   try {
     await fixture.registry.initialize();
@@ -643,10 +1806,10 @@ test("deleting an inactive session uses a temporary helper instead of borrowing 
 
     await fixture.registry.deleteSession(sessionB);
 
-    assert.deepEqual(fixture.services[1]!.deletedSessions, [sessionB]);
-    assert.equal(fixture.services[1]!.stopped, true);
+    assert.equal(fixture.services.length, 1);
     assert.equal(runtimeA.snapshot().state, "running");
     assert.equal(runtimeA.stopped, false);
+    await assert.rejects(stat(sessionB), { code: "ENOENT" });
   } finally {
     await fixture.registry.stop();
     await rm(fixture.root, { recursive: true, force: true });
@@ -701,8 +1864,108 @@ test("New Session works for a released selection without commandeering a busy ru
     assert.equal(fixture.services[0]!.stopped, true);
     assert.equal(runtimeB.snapshot().state, "running");
     assert.equal(runtimeB.stopped, false);
-    assert.equal(fixture.services[2]!.newSessionCount, 1);
+    assert.equal(fixture.services[2]!.newSessionCount, 0);
     assert.equal(fixture.services[2]!.stopped, false);
+  } finally {
+    await fixture.registry.stop();
+    await rm(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test("New Session starts another runtime in the same project when its selected session is busy", async () => {
+  const fixture = await createFixture(3);
+  try {
+    await fixture.registry.initialize();
+    const busySessionId = fixture.registry.snapshot().activeSessionId!;
+    await fixture.registry.sendMessage("keep this session running", "busy-session", busySessionId);
+    const busyRuntime = fixture.services[0]!;
+
+    await fixture.registry.newSession();
+
+    const newSessionId = fixture.registry.snapshot().activeSessionId!;
+    assert.notEqual(newSessionId, busySessionId);
+    assert.match(newSessionId, /fresh-[0-9a-f-]+\.jsonl$/);
+    assert.equal(fixture.registry.snapshot().sessions.find(({ id }) => id === newSessionId)?.cwd, fixture.cwd);
+    assert.equal(fixture.services.length, 2);
+    assert.equal(fixture.services[1]!.newSessionCount, 0);
+    assert.equal(busyRuntime.snapshot().state, "running");
+    assert.equal(busyRuntime.stopped, false);
+  } finally {
+    await fixture.registry.stop();
+    await rm(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test("New Session inherits the model from the awake session in the same project", async () => {
+  const fixture = await createFixture(3);
+  try {
+    await fixture.registry.initialize();
+    const sourceSessionId = fixture.registry.snapshot().activeSessionId!;
+    await fixture.registry.wakeSession(sourceSessionId);
+    await fixture.registry.changeModel(sourceSessionId, "fake", "changed-model");
+    await fixture.registry.sendMessage("keep this session running", "busy-session", sourceSessionId);
+
+    await fixture.registry.newSession();
+
+    const newSessionId = fixture.registry.snapshot().activeSessionId!;
+    assert.notEqual(newSessionId, sourceSessionId);
+    assert.equal(fixture.registry.snapshot().model?.id, "changed-model");
+    assert.equal(fixture.services[1]!.snapshot().model?.id, "changed-model");
+    assert.equal(fixture.services[0]!.snapshot().state, "running");
+  } finally {
+    await fixture.registry.stop();
+    await rm(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test("New Session starts an isolated runtime when another session in the project is busy", async () => {
+  const fixture = await createFixture(3);
+  try {
+    await fixture.registry.initialize();
+    const selectedIdleSessionId = fixture.registry.snapshot().activeSessionId!;
+    const busySessionId = fixture.sessions.find(({ id }) => id !== selectedIdleSessionId)!.id;
+    await fixture.registry.wakeSession(busySessionId);
+    await fixture.registry.sendMessage("keep this session running", "other-busy-session", busySessionId);
+    const busyRuntime = fixture.services[0]!;
+
+    // Keep an idle session selected while another session in the same project
+    // is running, matching the background-runtime case in the UI.
+    await fixture.registry.switchSession(selectedIdleSessionId);
+    await fixture.registry.newSession();
+
+    const newSessionId = fixture.registry.snapshot().activeSessionId!;
+    assert.notEqual(newSessionId, selectedIdleSessionId);
+    assert.notEqual(newSessionId, busySessionId);
+    assert.match(newSessionId, /fresh-[0-9a-f-]+\.jsonl$/);
+    assert.equal(fixture.registry.snapshot().sessions.find(({ id }) => id === newSessionId)?.cwd, fixture.cwd);
+    assert.equal(fixture.services.length, 2);
+    assert.equal(fixture.services[1]!.newSessionCount, 0);
+    assert.equal(busyRuntime.snapshot().state, "running");
+    assert.equal(busyRuntime.stopped, false);
+  } finally {
+    await fixture.registry.stop();
+    await rm(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test("New Session retries in a fresh runtime if Pi becomes busy during the new-session command", async () => {
+  const fixture = await createFixture(3);
+  try {
+    await fixture.registry.initialize();
+    const previouslySelected = fixture.registry.snapshot().activeSessionId!;
+    await fixture.registry.wakeSession(previouslySelected);
+    const existingRuntime = fixture.services[0]!;
+    existingRuntime.startRunningBeforeNewSessionError = true;
+
+    await fixture.registry.newSession();
+
+    const newSessionId = fixture.registry.snapshot().activeSessionId!;
+    assert.notEqual(newSessionId, previouslySelected);
+    assert.match(newSessionId, /fresh-[0-9a-f-]+\.jsonl$/);
+    assert.equal(fixture.services.length, 2);
+    assert.equal(existingRuntime.snapshot().state, "running");
+    assert.equal(existingRuntime.stopped, false);
+    assert.equal(fixture.services[1]!.newSessionCount, 0);
   } finally {
     await fixture.registry.stop();
     await rm(fixture.root, { recursive: true, force: true });

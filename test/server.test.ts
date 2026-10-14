@@ -1,19 +1,26 @@
 import assert from "node:assert/strict";
 import { request as httpRequest } from "node:http";
 import test from "node:test";
-import { createPaneServer, DEFAULT_PORT, resolvePort } from "../src/server.ts";
+import { createPaneServer, DEFAULT_PORT, listenLocal, resolvePort } from "../src/server.ts";
 import type { PiVotEvent, PiVotSnapshot } from "../src/pi-service.ts";
 
 class FakeService {
   state = "idle";
   messages: string[] = [];
   imageRequests: Array<{ message: string; images: Array<{ mimeType: string; data: string; name?: string }> }> = [];
+  messageModes: Array<"send" | "queue" | "steer" | undefined> = [];
   aborts = 0;
+  browserTestResets = 0;
   messageTargets: Array<string | undefined> = [];
+  queuedIds = ["queued-a", "queued-b"];
+  newSessionMessages: Array<{ directory: string; sessionId: string | undefined }> = [];
   abortTargets: Array<string | undefined> = [];
   compactions = 0;
   modelListTargets: string[] = [];
+  promptTemplateTargets: string[] = [];
   modelChanges: Array<{ sessionId: string; provider: string; modelId: string }> = [];
+  projectModelRequests: Array<{ directory: string; provider?: string; modelId?: string }> = [];
+  historyRequests: Array<{ sessionId: string; beforeId: string; revision: string }> = [];
   sessionActions: string[] = [];
   wakeTargets: string[] = [];
   wakeError?: string;
@@ -25,11 +32,16 @@ class FakeService {
     return () => this.listeners.delete(listener);
   }
 
+  resetForBrowserTest(): void {
+    this.browserTestResets++;
+  }
+
   async sendMessage(
     message: string,
     _messageId?: string,
     sessionId?: string,
     images: Array<{ mimeType: string; data: string; name?: string }> = [],
+    mode?: "send" | "queue" | "steer",
   ): Promise<string> {
     this.messages.push(message);
     this.imageRequests.push({
@@ -37,7 +49,22 @@ class FakeService {
       images: images.map(({ mimeType, data, name }) => ({ mimeType, data, ...(name ? { name } : {}) })),
     });
     this.messageTargets.push(sessionId);
+    this.messageModes.push(mode);
     return this.state === "running" ? "steered" : "started";
+  }
+
+  async sendNewSessionMessage(
+    message: string,
+    messageId: string,
+    sessionId: string | undefined,
+    images: Array<{ mimeType: string; data: string; name?: string }>,
+    mode: "send" | "queue" | "steer" | undefined,
+    directory: string,
+  ): Promise<{ disposition: string; sessionId: string }> {
+    const target = sessionId ?? `${directory}/deferred.jsonl`;
+    this.newSessionMessages.push({ directory, sessionId });
+    const disposition = await this.sendMessage(message, messageId, target, images, mode);
+    return { disposition, sessionId: target };
   }
 
   snapshot(): PiVotSnapshot {
@@ -60,6 +87,23 @@ class FakeService {
     this.abortTargets.push(sessionId);
   }
 
+  async cancelQueuedMessage(messageId: string, sessionId?: string): Promise<boolean> {
+    this.messageTargets.push(sessionId);
+    const index = this.queuedIds.indexOf(messageId);
+    if (index < 0) return false;
+    this.queuedIds.splice(index, 1);
+    this.emit({ type: "queued_message_cancelled", id: messageId, sessionId });
+    return true;
+  }
+
+  async clearQueuedMessages(sessionId?: string): Promise<string[]> {
+    const cancelledIds = [...this.queuedIds];
+    this.queuedIds = [];
+    for (const id of cancelledIds)
+      this.emit({ type: "queued_message_cancelled", id, sessionId });
+    return cancelledIds;
+  }
+
   async compact(): Promise<void> {
     this.compactions++;
   }
@@ -72,6 +116,37 @@ class FakeService {
       model: { provider: "test", id: "current", name: "Current" },
       models: [{ provider: "test", id: "next", name: "Next" }],
       canChange: true,
+    };
+  }
+
+  async getPromptTemplates(sessionId: string) {
+    this.promptTemplateTargets.push(sessionId);
+    return {
+      sessionId,
+      hasRuntime: true,
+      commands: [{ name: "review", description: "Review the requested changes." }],
+    };
+  }
+
+  async getProjectAvailableModels(directory: string) {
+    this.projectModelRequests.push({ directory });
+    return { projectDirectory: directory, sessionId: "", hasRuntime: true,
+      model: { provider: "test", id: "next", name: "Next" },
+      models: [{ provider: "test", id: "next", name: "Next" }], canChange: true };
+  }
+
+  async changeProjectModel(directory: string, provider: string, modelId: string) {
+    this.projectModelRequests.push({ directory, provider, modelId });
+    return { projectDirectory: directory, model: { provider, id: modelId, name: modelId } };
+  }
+
+  async getOlderTranscriptPage(sessionId: string, beforeId: string, revision: string) {
+    this.historyRequests.push({ sessionId, beforeId, revision });
+    return {
+      sessionId,
+      historyRevision: revision,
+      items: [{ id: "older-1", type: "user" as const, text: "Earlier message" }],
+      hasOlder: false,
     };
   }
 
@@ -127,9 +202,10 @@ class FakeService {
 async function withServer(callback: (url: string, service: FakeService) => Promise<void>): Promise<void> {
   const service = new FakeService();
   const app = createPaneServer(service);
-  await new Promise<void>((resolve) => app.server.listen(0, "127.0.0.1", resolve));
+  await new Promise<void>((resolve) => listenLocal(app.server, 0, resolve));
   const address = app.server.address();
   assert.ok(address && typeof address !== "string");
+  assert.equal(address.address, "127.0.0.1");
   try {
     await callback(`http://127.0.0.1:${address.port}`, service);
   } finally {
@@ -138,21 +214,55 @@ async function withServer(callback: (url: string, service: FakeService) => Promi
   }
 }
 
-function postWithHost(url: string, host: string, body: string): Promise<number> {
+test("browser test reset requests are handled by one server route", async () => {
+  await withServer(async (url, service) => {
+    const response = await fetch(`${url}/__test__/reset`, { method: "POST" });
+    assert.equal(response.status, 204);
+    assert.equal(await response.text(), "");
+    assert.equal(service.browserTestResets, 1);
+  });
+});
+
+function postWithHost(url: string, host: string, body: string, origin?: string): Promise<number> {
   const address = new URL(url);
   return new Promise((resolve, reject) => {
+    const headers: Record<string, string | number> = {
+      host,
+      "content-type": "application/json",
+      "content-length": Buffer.byteLength(body),
+    };
+    if (origin) headers.origin = origin;
     const request = httpRequest({
       hostname: "127.0.0.1",
       port: address.port,
       path: "/api/message",
       method: "POST",
-      headers: { host, "content-type": "application/json", "content-length": Buffer.byteLength(body) },
+      headers,
     }, (response) => {
       response.resume();
       response.once("end", () => resolve(response.statusCode ?? 0));
     });
     request.once("error", reject);
     request.end(body);
+  });
+}
+
+function getWithHost(url: string, path: string, host: string): Promise<number> {
+  const address = new URL(url);
+  return new Promise((resolve, reject) => {
+    const request = httpRequest({
+      hostname: "127.0.0.1",
+      port: address.port,
+      path,
+      method: "GET",
+      headers: { host },
+    }, (response) => {
+      response.resume();
+      resolve(response.statusCode ?? 0);
+      response.destroy();
+    });
+    request.once("error", reject);
+    request.end();
   });
 }
 
@@ -170,7 +280,7 @@ test("HTTP commands validate input, route sends and stop separately, and report 
     const sent = await fetch(`${url}/api/message`, {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({ message: "redirect this run", sessionId: "/project/session-a.jsonl" }),
+      body: JSON.stringify({ message: "redirect this run", sessionId: "/project/session-a.jsonl", mode: "steer" }),
     });
     assert.equal(sent.status, 202);
     const sendResult = await sent.json();
@@ -178,6 +288,24 @@ test("HTTP commands validate input, route sends and stop separately, and report 
     assert.match(sendResult.messageId, /^[\da-f-]{36}$/i);
     assert.deepEqual(service.messages, ["redirect this run"]);
     assert.deepEqual(service.messageTargets, ["/project/session-a.jsonl"]);
+    assert.deepEqual(service.messageModes, ["steer"]);
+
+    const pending = await fetch(`${url}/api/message`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        message: "start in chosen project",
+        projectDirectory: "/project/chosen",
+      }),
+    });
+    assert.equal(pending.status, 202);
+    const pendingResult = await pending.json();
+    assert.equal(pendingResult.sessionId, "/project/chosen/deferred.jsonl");
+    assert.deepEqual(service.newSessionMessages, [{
+      directory: "/project/chosen",
+      sessionId: undefined,
+    }]);
+    assert.deepEqual(service.messageTargets.at(-1), "/project/chosen/deferred.jsonl");
 
     const stopped = await fetch(`${url}/api/stop`, {
       method: "POST",
@@ -194,6 +322,28 @@ test("HTTP commands validate input, route sends and stop separately, and report 
     const health = await (await fetch(`${url}/api/health`)).json();
     assert.equal(health.state, "running");
     assert.equal(health.isCompacting, false);
+  });
+});
+
+test("HTTP queue controls cancel one message or clear the waiting group", async () => {
+  await withServer(async (url, service) => {
+    const one = await fetch(`${url}/api/queue/cancel`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ messageId: "queued-a", sessionId: "/project/session-a.jsonl" }),
+    });
+    assert.equal(one.status, 200);
+    assert.deepEqual((await one.json()).cancelledIds, ["queued-a"]);
+    assert.deepEqual(service.queuedIds, ["queued-b"]);
+
+    const all = await fetch(`${url}/api/queue/clear`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ sessionId: "/project/session-a.jsonl" }),
+    });
+    assert.equal(all.status, 200);
+    assert.deepEqual((await all.json()).cancelledIds, ["queued-b"]);
+    assert.deepEqual(service.queuedIds, []);
   });
 });
 
@@ -227,6 +377,74 @@ test("model routes require protected JSON and target the requested runtime", asy
       body: "{}",
     });
     assert.equal(unsupported.status, 415);
+  });
+});
+
+test("prompt template discovery requires a protected request and targets the selected runtime", async () => {
+  await withServer(async (url, service) => {
+    const response = await fetch(`${url}/api/prompt-templates`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ sessionId: "/project/session-a.jsonl" }),
+    });
+    assert.equal(response.status, 200);
+    assert.deepEqual((await response.json()).commands, [
+      { name: "review", description: "Review the requested changes." },
+    ]);
+    assert.deepEqual(service.promptTemplateTargets, ["/project/session-a.jsonl"]);
+
+    const invalid = await fetch(`${url}/api/prompt-templates`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({}),
+    });
+    assert.equal(invalid.status, 400);
+  });
+});
+
+test("model routes support a project target when directory browsing has no selected session", async () => {
+  await withServer(async (url, service) => {
+    const models = await fetch(`${url}/api/models`, {
+      method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ projectDirectory: "/fake/other" }),
+    });
+    assert.equal(models.status, 200);
+    assert.equal((await models.json()).models[0].id, "next");
+    assert.deepEqual(service.projectModelRequests, [{ directory: "/fake/other" }]);
+    const changed = await fetch(`${url}/api/model`, {
+      method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ projectDirectory: "/fake/other", provider: "test", modelId: "next" }),
+    });
+    assert.equal(changed.status, 200);
+    assert.deepEqual(service.projectModelRequests[1], {
+      directory: "/fake/other", provider: "test", modelId: "next",
+    });
+  });
+});
+
+test("history route requires a session-bound stable cursor and returns only the requested page", async () => {
+  await withServer(async (url, service) => {
+    const query = new URLSearchParams({
+      sessionId: "/project/session-a.jsonl",
+      beforeId: "message-100",
+      revision: "history-v1",
+    });
+    const response = await fetch(`${url}/api/history?${query}`);
+    assert.equal(response.status, 200);
+    assert.deepEqual(await response.json(), {
+      sessionId: "/project/session-a.jsonl",
+      historyRevision: "history-v1",
+      items: [{ id: "older-1", type: "user", text: "Earlier message" }],
+      hasOlder: false,
+    });
+    assert.deepEqual(service.historyRequests, [{
+      sessionId: "/project/session-a.jsonl",
+      beforeId: "message-100",
+      revision: "history-v1",
+    }]);
+
+    const missingCursor = await fetch(`${url}/api/history?sessionId=%2Fproject%2Fsession-a.jsonl`);
+    assert.equal(missingCursor.status, 400);
   });
 });
 
@@ -295,6 +513,9 @@ test("static browser assets are served from the explicit asset list only", async
     assert.match(await marked.text(), /marked/);
     assert.match((await (await fetch(`${url}/vendor/highlight.min.js`)).text()).slice(0, 100), /highlight\.js/i);
     assert.match((await (await fetch(`${url}/markdown-security.js`)).text()), /safeMarkdownHref/);
+    const help = await fetch(`${url}/help.md`);
+    assert.match(help.headers.get("content-type") ?? "", /^text\/markdown/);
+    assert.match(await help.text(), /Send, Steer, and Queue/);
     const health = await fetch(`${url}/api/health`);
     assert.match(health.headers.get("content-security-policy") ?? "", /frame-ancestors 'none'/);
 
@@ -312,12 +533,17 @@ test("mutation endpoints require a local Host and reject foreign Origins", async
       method: "POST",
       headers: {
         "content-type": "application/json; charset=utf-8",
-        origin: `http://localhost:${port}`,
+        origin: `http://127.0.0.1:${port}`,
       },
       body,
     });
 
     assert.equal(accepted.status, 202);
+
+    assert.equal(
+      await postWithHost(url, `localhost:${port}`, body, `http://localhost:${port}`),
+      202,
+    );
 
     const noOrigin = await fetch(`${url}/api/message`, {
       method: "POST",
@@ -338,7 +564,8 @@ test("mutation endpoints require a local Host and reject foreign Origins", async
     assert.match((await foreignOrigin.json()).error, /local origin/);
 
     assert.equal(await postWithHost(url, `malicious.example:${port}`, body), 403);
-    assert.equal(service.messages.length, 2);
+    assert.equal(await postWithHost(url, `127.0.0.1:${port + 1}`, body), 403);
+    assert.equal(service.messages.length, 3);
 
     const deniedStop = await fetch(`${url}/api/stop`, {
       method: "POST",
@@ -346,6 +573,25 @@ test("mutation endpoints require a local Host and reject foreign Origins", async
     });
     assert.equal(deniedStop.status, 403);
     assert.equal(service.aborts, 0);
+  });
+});
+
+test("API reads require the exact local Host authority", async () => {
+  await withServer(async (url) => {
+    const port = Number(new URL(url).port);
+    for (const path of ["/api/health", "/api/events"]) {
+      for (const host of [`127.0.0.1:${port}`, `localhost:${port}`]) {
+        assert.equal(await getWithHost(url, path, host), 200, `${path} rejected Host ${host}`);
+      }
+    }
+    for (const path of ["/api/health", "/api/events"]) {
+      for (const host of [
+        `malicious.example:${port}`,
+        `127.0.0.1:${port + 1}`,
+      ]) {
+        assert.equal(await getWithHost(url, path, host), 403, `${path} accepted Host ${host}`);
+      }
+    }
   });
 });
 
@@ -449,11 +695,22 @@ test("SSE streams normalized application events and sends a state snapshot", asy
     assert.equal(response.headers.get("x-content-type-options"), "nosniff");
     const reader = response.body!.getReader();
     const decoder = new TextDecoder();
-    const snapshot = decoder.decode((await reader.read()).value);
+    let buffered = "";
+    const readUntil = async (pattern: RegExp): Promise<string> => {
+      while (!pattern.test(buffered)) {
+        const next = await reader.read();
+        assert.equal(next.done, false, "SSE stream ended before the expected event arrived");
+        buffered += decoder.decode(next.value, { stream: true });
+      }
+      const text = buffered;
+      buffered = "";
+      return text;
+    };
+    const snapshot = await readUntil(/"type":"snapshot","state":"idle"/);
     assert.match(snapshot, /"type":"snapshot","state":"idle"/);
 
     service.emit({ type: "assistant_delta", messageId: "assistant-1", text: "live" });
-    const update = decoder.decode((await reader.read()).value);
+    const update = await readUntil(/"type":"assistant_delta"/);
     assert.match(update, /"type":"assistant_delta"/);
     assert.match(update, /"text":"live"/);
     await reader.cancel();

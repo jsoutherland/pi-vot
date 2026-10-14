@@ -126,19 +126,39 @@ try {
     await chmod(nodeShim, 0o755);
 
     const rejectedVersions = [
-      ["v21.7.0", /currently supports Node 22\.x only.*Detected: v21\.7\.0/s],
-      ["v22.8.0", /requires Node 22\.19 or newer.*Detected: v22\.8\.0/s],
-      ["v23.2.0", /currently supports Node 22\.x only.*Detected: v23\.2\.0/s],
+      ["v21.7.0", /requires Node\.js >=22\.19\.0.*Detected: v21\.7\.0/s],
+      ["v22.18.9", /requires Node\.js >=22\.19\.0.*Detected: v22\.18\.9/s],
     ];
     for (const [version, message] of rejectedVersions) {
       const result = spawnSync(powershell, ["-NoProfile", "-File", join(releaseRoot, "pi-vot.ps1")], {
         cwd: callerDirectory,
-        env: { ...process.env, PATH: shimDirectory, FAKE_NODE_VERSION: version },
+        env: { ...process.env, PATH: shimDirectory, FAKE_NODE_VERSION: version, PI_VOT_ALLOW_UNSUPPORTED_NODE: "" },
         encoding: "utf8",
         timeout: 10_000,
       });
       assert.notEqual(result.status, 0, `${version} must be rejected`);
       assert.match(`${result.stdout}\n${result.stderr}`, message);
+    }
+
+    for (const [version, override] of [
+      ["v24.21.0", ""],
+      ["v99.0.0", "true"],
+      ["v20.19.0", "1"],
+    ]) {
+      const result = spawnSync(powershell, ["-NoProfile", "-File", join(releaseRoot, "pi-vot.ps1")], {
+        cwd: callerDirectory,
+        env: {
+          ...process.env,
+          PATH: shimDirectory,
+          FAKE_NODE_VERSION: version,
+          FAKE_NODE_LOG: shimLog,
+          FAKE_NODE_EXIT_CODE: "37",
+          PI_VOT_ALLOW_UNSUPPORTED_NODE: override,
+        },
+        encoding: "utf8",
+        timeout: 10_000,
+      });
+      assert.equal(result.status, 37, `${version} with override ${JSON.stringify(override)} should launch Node`);
     }
 
     const propagated = spawnSync(powershell, ["-NoProfile", "-File", join(releaseRoot, "pi-vot.ps1")], {

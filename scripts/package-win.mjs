@@ -18,7 +18,7 @@ const coreRoot = resolve(repositoryRoot, "build/release-core");
 const packageInfo = JSON.parse(await readFile(resolve(repositoryRoot, "package.json"), "utf8"));
 const releaseRoot = resolve(repositoryRoot, `release/pi-vot-${packageInfo.version}-win-x64`);
 const zipPath = `${releaseRoot}.zip`;
-const { MINIMUM_NODE_VERSION, MAXIMUM_NODE_VERSION_EXCLUSIVE } = await import(pathToFileURL(resolve(coreRoot, "app/runtime-policy.js")));
+const { MINIMUM_NODE_VERSION, TESTED_NODE_MAJOR } = await import(pathToFileURL(resolve(coreRoot, "app/runtime-policy.js")));
 const vendorInfo = JSON.parse(await readFile(resolve(coreRoot, "app/web/vendor/THIRD_PARTY.json"), "utf8"));
 
 const psLauncher = String.raw`$ErrorActionPreference = 'Stop'
@@ -45,18 +45,14 @@ if ($LASTEXITCODE -ne 0 -or $VersionText -notmatch '^v?(\d+)\.(\d+)\.(\d+)$') {
 }
 $Detected = [version]("$($Matches[1]).$($Matches[2]).$($Matches[3])")
 $Minimum = [version]$Manifest.node.minimum
-$MaximumExclusive = [version]$Manifest.node.maximumExclusive
-if ($Detected.Major -ne $Minimum.Major) {
-    [Console]::Error.WriteLine(('Pi-vot currently supports Node ' + $Minimum.Major + '.x only.' + [Environment]::NewLine + 'Detected: ' + $VersionText))
-    exit 1
-}
 if ($Detected -lt $Minimum) {
-    [Console]::Error.WriteLine(('Pi-vot requires Node ' + $Minimum.Major + '.' + $Minimum.Minor + ' or newer within the Node ' + $Minimum.Major + ' release line.' + [Environment]::NewLine + 'Detected: ' + $VersionText))
-    exit 1
-}
-if ($Detected -ge $MaximumExclusive) {
-    [Console]::Error.WriteLine(('Pi-vot currently supports Node ' + $Minimum.Major + '.x only.' + [Environment]::NewLine + 'Detected: ' + $VersionText))
-    exit 1
+    if ($env:PI_VOT_ALLOW_UNSUPPORTED_NODE -ceq '1') {
+        [Console]::Error.WriteLine(('WARNING: Pi-vot is running on Node ' + $VersionText + ' below the minimum ' + $Manifest.node.minimum + '.'))
+        [Console]::Error.WriteLine('PI_VOT_ALLOW_UNSUPPORTED_NODE=1 is set; continuing anyway.')
+    } else {
+        [Console]::Error.WriteLine(('Pi-vot requires Node.js >=' + $Manifest.node.minimum + '.' + [Environment]::NewLine + 'Detected: ' + $VersionText))
+        exit 1
+    }
 }
 
 if (-not (Get-Command pi -ErrorAction SilentlyContinue)) {
@@ -75,11 +71,20 @@ Preferred:
   PowerShell (from the project directory; run the script by full path if installed elsewhere):
   .\pi-vot.ps1
 
+Install this extracted directory as a Pi package:
+  pi install "C:\Tools\pi-vot-${packageInfo.version}-win-x64"
+  Restart Pi if it was already running, then type /pi-vot at Pi's prompt.
+  Do not use "pi install pi-vot" for this ZIP; that names an npm package, not this folder.
+  Pi packages cannot add a top-level command named pi pi-vot.
+
 Fallback if PowerShell scripts are restricted:
   node "C:\Tools\pi-vot-${packageInfo.version}-win-x64\app\server.js"
 
-Requires Node.js 22.19+ in the Node 22 release line, Pi installed/configured, and Chrome/Chromium.
+Minimum Node.js: >= 22.19.0. Recommended/tested baseline: Node 22.
+Newer Node versions are allowed but may not have received the same level of validation.
+Pi installed/configured and Chrome/Chromium are also required.
 No npm install or build is needed.
+The server opens the default browser when ready. Set PI_VOT_OPEN_BROWSER=0 to disable this.
 Default URL: http://127.0.0.1:17361 (only PI_VOT_PORT overrides the port; generic PORT is ignored).
 
 PowerShell port override:
@@ -91,7 +96,21 @@ cmd.exe port override:
   set PI_VOT_PORT=18000
   node "C:\Tools\pi-vot-${packageInfo.version}-win-x64\app\server.js"
 
-Temporary unsupported Node override (testing only; the value must be exactly 1):
+Optional Pi executable override:
+  PI_VOT_PI_EXECUTABLE pins the installed Pi executable or launcher explicitly.
+  It must be an absolute path; project-relative paths are not accepted. On Windows,
+  it may point to Pi's absolute .cmd shim.
+
+  PowerShell:
+    $env:PI_VOT_PI_EXECUTABLE = "C:\Users\you\AppData\Roaming\npm\pi.cmd"
+    node "C:\Tools\pi-vot-${packageInfo.version}-win-x64\app\server.js"
+    Remove-Item Env:PI_VOT_PI_EXECUTABLE
+
+  cmd.exe:
+    set "PI_VOT_PI_EXECUTABLE=C:\Users\you\AppData\Roaming\npm\pi.cmd"
+    node "C:\Tools\pi-vot-${packageInfo.version}-win-x64\app\server.js"
+
+Older Node override (only for versions below 22.19.0; the value must be exactly 1):
   PowerShell:
     $env:PI_VOT_ALLOW_UNSUPPORTED_NODE = "1"
     node "C:\Tools\pi-vot-${packageInfo.version}-win-x64\app\server.js"
@@ -101,6 +120,8 @@ Temporary unsupported Node override (testing only; the value must be exactly 1):
     set PI_VOT_ALLOW_UNSUPPORTED_NODE=1
     node "C:\Tools\pi-vot-${packageInfo.version}-win-x64\app\server.js"
 
+Node 22.19.0 and newer start without this override. Newer-than-tested Node majors print an advisory and continue.
+
 If local policy restricts PowerShell scripts, do not weaken policy for Pi-vot; launch with the approved Node executable. Organizations requiring signed scripts can sign the launcher through their normal deployment process.
 `;
 
@@ -109,19 +130,26 @@ const finalFiles = [
   "app/runtime-policy.js",
   "app/pi-service.js",
   "app/runtime-registry.js",
+  "app/big-pi.js",
+  "app/billion-context-pi.js",
   "app/request.js",
   "app/package.json",
   "app/web/index.html",
   "app/web/main.js",
   "app/web/markdown-security.js",
   "app/web/style.css",
+  "app/web/help.md",
   "app/web/vendor/THIRD_PARTY.json",
   "app/web/vendor/highlight-LICENSE",
   "app/web/vendor/highlight.min.js",
   "app/web/vendor/marked-LICENSE.md",
   "app/web/vendor/marked.umd.js",
   "README.md",
+  "CHANGELOG.md",
   "LICENSE",
+  "package.json",
+  "pi-vot-extension.js",
+  "browser-launch.js",
   "pi-vot.ps1",
   "START-HERE.txt",
   "RELEASE-MANIFEST.json",
@@ -143,9 +171,9 @@ async function writeManifest() {
     arch: "x64",
     node: {
       minimum: MINIMUM_NODE_VERSION,
-      maximumExclusive: MAXIMUM_NODE_VERSION_EXCLUSIVE,
+      recommendedTestedMajor: TESTED_NODE_MAJOR,
     },
-    launchMethods: ["PowerShell", "direct-node"],
+    launchMethods: ["PowerShell", "direct-node", "pi-package /pi-vot"],
     build: {
       gitCommit,
       timestamp: new Date().toISOString(),
@@ -194,7 +222,7 @@ async function validateRelease() {
     throw new Error(`Release allowlist validation failed. Unexpected: ${unexpected.join(", ") || "none"}. Missing: ${missing.join(", ") || "none"}.`);
   }
   const manifest = JSON.parse(await readFile(join(releaseRoot, "RELEASE-MANIFEST.json"), "utf8"));
-  if (manifest.node.minimum !== MINIMUM_NODE_VERSION || manifest.node.maximumExclusive !== MAXIMUM_NODE_VERSION_EXCLUSIVE) {
+  if (manifest.node.minimum !== MINIMUM_NODE_VERSION || manifest.node.recommendedTestedMajor !== TESTED_NODE_MAJOR) {
     throw new Error("Release Node version policy does not match the application.");
   }
   const checksums = (await readFile(join(releaseRoot, "SHA256SUMS"), "utf8")).trimEnd().split("\n");

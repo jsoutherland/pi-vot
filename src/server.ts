@@ -5,8 +5,20 @@ import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { dirname, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
-import type { ActiveModel, AvailableModelsResult, ContextUsage, PiVotEvent, PiVotSnapshot } from "./pi-service.ts";
-import { PiRuntimeRegistry } from "./runtime-registry.ts";
+import { openDefaultBrowser } from "../browser-launch.js";
+import type {
+  ActiveModel,
+  AvailableModelsResult,
+  ContextUsage,
+  PiVotEvent,
+  PiVotSnapshot,
+  PromptTemplateCommandsResult,
+} from "./pi-service.ts";
+import {
+  DeferredSessionSendError,
+  PiRuntimeRegistry,
+  type TranscriptHistoryPage,
+} from "./runtime-registry.ts";
 import { nodeVersionDecision } from "./runtime-policy.ts";
 import {
   MAX_IMAGE_REQUEST_BODY_BYTES,
@@ -23,6 +35,7 @@ const staticAssets = new Map<string, { fileName: string; contentType: string }>(
   ["/index.html", { fileName: "index.html", contentType: "text/html; charset=utf-8" }],
   ["/main.js", { fileName: "main.js", contentType: "text/javascript; charset=utf-8" }],
   ["/style.css", { fileName: "style.css", contentType: "text/css; charset=utf-8" }],
+  ["/help.md", { fileName: "help.md", contentType: "text/markdown; charset=utf-8" }],
   ["/markdown-security.js", { fileName: "markdown-security.js", contentType: "text/javascript; charset=utf-8" }],
   ["/vendor/marked.umd.js", { fileName: "vendor/marked.umd.js", contentType: "text/javascript; charset=utf-8" }],
   ["/vendor/highlight.min.js", { fileName: "vendor/highlight.min.js", contentType: "text/javascript; charset=utf-8" }],
@@ -45,14 +58,27 @@ export function resolvePort(env: NodeJS.ProcessEnv = process.env): number {
 
 export interface PiApplicationService {
   readonly state: string;
+  resetForBrowserTest?(): void;
   snapshot(): PiVotSnapshot;
+  getOlderTranscriptPage?(sessionId: string, beforeId: string, revision: string): Promise<TranscriptHistoryPage>;
   subscribe(listener: (event: PiVotEvent) => void): () => void;
   sendMessage(
     message: string,
     messageId?: string,
     sessionId?: string,
     images?: ImageAttachment[],
+    mode?: "send" | "queue" | "steer",
   ): Promise<string>;
+  cancelQueuedMessage?(messageId: string, sessionId?: string): Promise<boolean>;
+  clearQueuedMessages?(sessionId?: string): Promise<string[]>;
+  sendNewSessionMessage?(
+    message: string,
+    messageId: string,
+    sessionId: string | undefined,
+    images: ImageAttachment[],
+    mode: "send" | "queue" | "steer" | undefined,
+    directory: string,
+  ): Promise<{ disposition: string; sessionId: string }>;
   abort(sessionId?: string): Promise<void>;
   compact(sessionId?: string): Promise<void>;
   refreshPersistedState?(): Promise<void>;
@@ -64,6 +90,9 @@ export interface PiApplicationService {
   releaseRuntime?(sessionId: string): Promise<void>;
   changeProjectDirectory?(directory: string): Promise<void>;
   getAvailableModels?(sessionId: string): Promise<AvailableModelsResult>;
+  getPromptTemplates?(sessionId: string): Promise<PromptTemplateCommandsResult>;
+  getProjectAvailableModels?(directory: string): Promise<AvailableModelsResult & { projectDirectory: string }>;
+  changeProjectModel?(directory: string, provider: string, modelId: string): Promise<{ projectDirectory: string; model: ActiveModel }>;
   changeModel?(sessionId: string, provider: string, modelId: string): Promise<{
     sessionId: string;
     model: ActiveModel | null;
@@ -103,21 +132,7 @@ function isLoopbackAddress(address: string | undefined): boolean {
 }
 
 function localAuthority(authority: string | undefined, port: number): boolean {
-  if (!authority) return false;
-  try {
-    const parsed = new URL(`http://${authority}`);
-    return (
-      (parsed.hostname === "127.0.0.1" || parsed.hostname === "localhost") &&
-      (parsed.port || "80") === String(port) &&
-      !parsed.username &&
-      !parsed.password &&
-      parsed.pathname === "/" &&
-      !parsed.search &&
-      !parsed.hash
-    );
-  } catch {
-    return false;
-  }
+  return authority === `127.0.0.1:${port}` || authority === `localhost:${port}`;
 }
 
 function localOrigin(origin: string, port: number): boolean {
@@ -149,19 +164,29 @@ function rejectUnsafeMutation(request: IncomingMessage, response: ServerResponse
   return false;
 }
 
+function rejectUnsafeApiRequest(request: IncomingMessage, response: ServerResponse, port: number): boolean {
+  if (!isLoopbackAddress(request.socket.remoteAddress) || !localAuthority(request.headers.host, port)) {
+    sendJson(response, 403, { error: "Requests must use Pi-vot's local address." });
+    return true;
+  }
+  return false;
+}
+
 function isJsonRequest(request: IncomingMessage): boolean {
   return (request.headers["content-type"] ?? "").split(";", 1)[0].trim().toLowerCase() === "application/json";
 }
 
 function selectDirectory(): Promise<string | null> {
   const choices: Array<{ command: string; args: string[] }> = process.platform === "win32"
+    // FolderBrowserDialog has no browser-window handle to own it. A tiny transparent topmost
+    // WinForms owner keeps the native picker modal and above the browser instead of behind it.
     ? [{
         command: "powershell.exe",
         args: [
           "-NoProfile",
           "-STA",
           "-Command",
-          "[Console]::OutputEncoding = [System.Text.Encoding]::UTF8; Add-Type -AssemblyName System.Windows.Forms; $dialog = New-Object System.Windows.Forms.FolderBrowserDialog; if ($dialog.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Write($dialog.SelectedPath) }",
+          "[Console]::OutputEncoding = [System.Text.Encoding]::UTF8; Add-Type -AssemblyName System.Windows.Forms; $dialog = New-Object System.Windows.Forms.FolderBrowserDialog; $owner = New-Object System.Windows.Forms.Form; $owner.ShowInTaskbar = $false; $owner.FormBorderStyle = [System.Windows.Forms.FormBorderStyle]::None; $owner.StartPosition = [System.Windows.Forms.FormStartPosition]::CenterScreen; $owner.Size = New-Object System.Drawing.Size(1, 1); $owner.Opacity = 0; $owner.TopMost = $true; $owner.Show(); $owner.Activate(); try { if ($dialog.ShowDialog($owner) -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Write($dialog.SelectedPath) } } finally { $owner.Close(); $owner.Dispose(); $dialog.Dispose() }",
         ],
       }]
     : process.platform === "darwin"
@@ -293,8 +318,88 @@ export function createPaneServer(service: PiApplicationService) {
   async function handleRequest(request: IncomingMessage, response: ServerResponse): Promise<void> {
     applySecurityHeaders(response);
     const url = new URL(request.url ?? "/", "http://127.0.0.1");
+    if (request.method === "POST" && url.pathname === "/__test__/reset" && service.resetForBrowserTest) {
+      const address = server.address();
+      const port = address && typeof address !== "string" ? address.port : 0;
+      if (rejectUnsafeMutation(request, response, port)) return;
+      service.resetForBrowserTest();
+      response.writeHead(204).end();
+      return;
+    }
+    if (url.pathname.startsWith("/api/")) {
+      const address = server.address();
+      const port = address && typeof address !== "string" ? address.port : 0;
+      if (rejectUnsafeApiRequest(request, response, port)) return;
+    }
     if (request.method === "GET" && url.pathname === "/api/events") {
       openEventStream(request, response);
+      return;
+    }
+    if (request.method === "GET" && url.pathname === "/api/history") {
+      const sessionId = url.searchParams.get("sessionId") ?? "";
+      const beforeId = url.searchParams.get("beforeId") ?? "";
+      const revision = url.searchParams.get("revision") ?? "";
+      if (!sessionId || sessionId.length > 4096 || !beforeId || beforeId.length > 1024 ||
+        !revision || revision.length > 128) {
+        sendJson(response, 400, { error: "A session ID, history revision, and cursor are required." });
+        return;
+      }
+      if (!service.getOlderTranscriptPage) {
+        sendJson(response, 501, { error: "This Pi service does not support paged history." });
+        return;
+      }
+      try {
+        sendJson(response, 200, await service.getOlderTranscriptPage(sessionId, beforeId, revision));
+      } catch (error) {
+        sendJson(response, 409, {
+          error: error instanceof Error ? error.message : "Pi-vot could not load older history.",
+          ...(typeof error === "object" && error !== null &&
+            typeof (error as { historyRevision?: unknown }).historyRevision === "string"
+            ? { historyRevision: (error as { historyRevision: string }).historyRevision }
+            : {}),
+        });
+      }
+      return;
+    }
+    if (request.method === "POST" && (url.pathname === "/api/queue/cancel" || url.pathname === "/api/queue/clear")) {
+      const address = server.address();
+      const port = address && typeof address !== "string" ? address.port : 0;
+      if (rejectUnsafeMutation(request, response, port)) return;
+      const body = await requireJsonBody(request, response);
+      if (body === undefined) return;
+      const payload = typeof body === "object" && body !== null ? body as Record<string, unknown> : {};
+      const sessionId = typeof payload.sessionId === "string" ? payload.sessionId : undefined;
+      if (sessionId !== undefined && (!sessionId.trim() || sessionId.length > 4_096)) {
+        sendJson(response, 400, { error: "A valid Pi session ID is required." });
+        return;
+      }
+      try {
+        if (url.pathname === "/api/queue/cancel") {
+          if (typeof payload.messageId !== "string" || !payload.messageId.trim() || payload.messageId.length > 4_096) {
+            sendJson(response, 400, { error: "A queued message ID is required." });
+            return;
+          }
+          if (!service.cancelQueuedMessage) {
+            sendJson(response, 501, { error: "This Pi service cannot cancel queued messages." });
+            return;
+          }
+          const cancelled = await service.cancelQueuedMessage(payload.messageId, sessionId);
+          if (!cancelled) {
+            sendJson(response, 200, { cancelledIds: [], snapshot: service.snapshot() });
+            return;
+          }
+          sendJson(response, 200, { cancelledIds: [payload.messageId], snapshot: service.snapshot() });
+          return;
+        }
+        if (!service.clearQueuedMessages) {
+          sendJson(response, 501, { error: "This Pi service cannot clear queued messages." });
+          return;
+        }
+        const cancelledIds = await service.clearQueuedMessages(sessionId);
+        sendJson(response, 200, { cancelledIds, snapshot: service.snapshot() });
+      } catch (error) {
+        sendJson(response, 409, { error: error instanceof Error ? error.message : "Pi-vot could not cancel queued messages." });
+      }
       return;
     }
     if (request.method === "POST" && url.pathname === "/api/message") {
@@ -322,8 +427,51 @@ export function createPaneServer(service: PiApplicationService) {
           typeof body.sessionId === "string" && body.sessionId
           ? body.sessionId
           : undefined;
+        const projectDirectory = typeof body === "object" && body !== null &&
+          "projectDirectory" in body && typeof body.projectDirectory === "string"
+          ? body.projectDirectory
+          : undefined;
+        if (projectDirectory !== undefined && (!projectDirectory.trim() || projectDirectory.length > 4_096)) {
+          sendJson(response, 400, { error: "A valid project directory is required." });
+          return;
+        }
+        const requestedMode = typeof body === "object" && body !== null && "mode" in body
+          ? body.mode
+          : undefined;
+        if (requestedMode !== undefined && requestedMode !== "send" &&
+          requestedMode !== "queue" && requestedMode !== "steer") {
+          sendJson(response, 400, { error: "Message mode must be Send, Queue, or Steer." });
+          return;
+        }
         const messageId = requestedId ?? randomUUID();
-        const disposition = await service.sendMessage(message, messageId, sessionId, images);
+        if (projectDirectory !== undefined) {
+          if (!service.sendNewSessionMessage) {
+            sendJson(response, 409, { error: "This Pi service cannot create a pending project session." });
+            return;
+          }
+          const result = await service.sendNewSessionMessage(
+            message,
+            messageId,
+            sessionId,
+            images,
+            requestedMode,
+            projectDirectory,
+          );
+          sendJson(response, 202, {
+            disposition: result.disposition,
+            messageId,
+            sessionId: result.sessionId,
+            snapshot: service.snapshot(),
+          });
+          return;
+        }
+        const disposition = await service.sendMessage(
+          message,
+          messageId,
+          sessionId,
+          images,
+          requestedMode,
+        );
         sendJson(response, 202, { disposition, messageId });
       } catch (error) {
         const message = error instanceof Error ? error.message : "Pi could not process the message.";
@@ -338,12 +486,21 @@ export function createPaneServer(service: PiApplicationService) {
           message.startsWith("Attach no more")
           ? 400
           : message.includes("already responding") || message.includes("stopping") ||
+              message.includes("not running") || message.includes("is compacting") ||
               message.includes("selected model does not support image input") ||
               message.includes("Four Pi sessions") || message.includes("active Pi runtime") ||
               message.includes("before starting another")
             ? 409
             : 500;
-        sendJson(response, status, { error: message });
+        sendJson(response, status, {
+          error: message,
+          ...(error instanceof DeferredSessionSendError
+            ? { sessionId: error.sessionId }
+            : typeof error === "object" && error !== null && "sessionId" in error &&
+                typeof error.sessionId === "string"
+              ? { sessionId: error.sessionId }
+              : {}),
+        });
       }
       return;
     }
@@ -388,17 +545,26 @@ export function createPaneServer(service: PiApplicationService) {
       const body = await requireJsonBody(request, response);
       if (body === undefined) return;
       const payload = typeof body === "object" && body !== null ? body as Record<string, unknown> : {};
-      if (typeof payload.sessionId !== "string" || !payload.sessionId) {
-        sendJson(response, 400, { error: "A Pi session ID is required." });
+      const projectDirectory = typeof payload.projectDirectory === "string" ? payload.projectDirectory : undefined;
+      if ((!projectDirectory && (typeof payload.sessionId !== "string" || !payload.sessionId))) {
+        sendJson(response, 400, { error: "A Pi session ID or project directory is required." });
         return;
       }
       try {
         if (url.pathname === "/api/models") {
+          if (projectDirectory) {
+            if (!service.getProjectAvailableModels) {
+              sendJson(response, 501, { error: "This Pi service does not support project model selection." });
+              return;
+            }
+            sendJson(response, 200, await service.getProjectAvailableModels(projectDirectory));
+            return;
+          }
           if (!service.getAvailableModels) {
             sendJson(response, 501, { error: "This Pi service does not support model selection." });
             return;
           }
-          sendJson(response, 200, await service.getAvailableModels(payload.sessionId));
+          sendJson(response, 200, await service.getAvailableModels(payload.sessionId as string));
           return;
         }
         if (typeof payload.provider !== "string" || !payload.provider || payload.provider.length > 256 ||
@@ -406,14 +572,46 @@ export function createPaneServer(service: PiApplicationService) {
           sendJson(response, 400, { error: "A valid provider and model ID are required." });
           return;
         }
+        if (projectDirectory) {
+          if (!service.changeProjectModel) {
+            sendJson(response, 501, { error: "This Pi service does not support project model selection." });
+            return;
+          }
+          sendJson(response, 200, await service.changeProjectModel(projectDirectory, payload.provider, payload.modelId));
+          return;
+        }
         if (!service.changeModel) {
           sendJson(response, 501, { error: "This Pi service does not support model selection." });
           return;
         }
-        sendJson(response, 200, await service.changeModel(payload.sessionId, payload.provider, payload.modelId));
+        sendJson(response, 200, await service.changeModel(payload.sessionId as string, payload.provider, payload.modelId));
       } catch (error) {
         sendJson(response, 409, {
           error: error instanceof Error ? error.message : "Pi-vot could not complete the model operation.",
+        });
+      }
+      return;
+    }
+    if (request.method === "POST" && url.pathname === "/api/prompt-templates") {
+      const address = server.address();
+      const port = address && typeof address !== "string" ? address.port : 0;
+      if (rejectUnsafeMutation(request, response, port)) return;
+      const body = await requireJsonBody(request, response);
+      if (body === undefined) return;
+      const payload = typeof body === "object" && body !== null ? body as Record<string, unknown> : {};
+      if (typeof payload.sessionId !== "string" || !payload.sessionId.trim() || payload.sessionId.length > 4_096) {
+        sendJson(response, 400, { error: "A Pi session ID is required." });
+        return;
+      }
+      if (!service.getPromptTemplates) {
+        sendJson(response, 501, { error: "This Pi service does not support prompt template discovery." });
+        return;
+      }
+      try {
+        sendJson(response, 200, await service.getPromptTemplates(payload.sessionId));
+      } catch (error) {
+        sendJson(response, 409, {
+          error: error instanceof Error ? error.message : "Pi could not list prompt templates.",
         });
       }
       return;
@@ -521,13 +719,21 @@ export function createPaneServer(service: PiApplicationService) {
   };
 }
 
+export function listenLocal(
+  server: ReturnType<typeof createServer>,
+  port: number,
+  callback: () => void,
+): void {
+  server.listen(port, "127.0.0.1", callback);
+}
+
 async function main(): Promise<void> {
   const nodeDecision = nodeVersionDecision(
     process.versions.node,
     process.env.PI_VOT_ALLOW_UNSUPPORTED_NODE,
   );
   if (nodeDecision.status === "blocked") throw new Error(nodeDecision.error);
-  if (nodeDecision.status === "allowed") console.error(nodeDecision.warning);
+  if (nodeDecision.status === "allowed" || nodeDecision.status === "newer") console.error(nodeDecision.warning);
   await validateRuntimeAssets();
   const port = resolvePort();
   const pi = new PiRuntimeRegistry(process.cwd());
@@ -535,10 +741,12 @@ async function main(): Promise<void> {
     console.error(`Pi startup initialization failed: ${error instanceof Error ? error.message : String(error)}`);
   });
   const app = createPaneServer(pi);
-  app.server.listen(port, "127.0.0.1", () => {
+  listenLocal(app.server, port, () => {
     const address = app.server.address();
     const listeningPort = address && typeof address !== "string" ? address.port : port;
-    console.log(`Pi-vot is running at http://127.0.0.1:${listeningPort}`);
+    const url = `http://127.0.0.1:${listeningPort}`;
+    console.log(`Pi-vot is running at ${url}`);
+    if (process.env.PI_VOT_OPEN_BROWSER !== "0") openDefaultBrowser(url);
   });
 
   let shutdown: Promise<void> | undefined;
